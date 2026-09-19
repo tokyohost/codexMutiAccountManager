@@ -1,15 +1,15 @@
 # Codex Account Manager
 
-Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管理多个 ChatGPT Plus / Codex 账号。它为每个账号维护独立的 `CODEX_HOME`，切换账号只修改 Codex 的用户级环境变量，不会复制或修改用户的代码项目、Git 分支和工作区。
+Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管理多个 ChatGPT Plus / Codex 账号。应用共用一个 `CODEX_HOME`，每个账号只保存独立的 `auth.json` 登录快照，不会复制或修改用户的代码项目、Git 分支和工作区。
 
 ## 特性
 
 - pywebview + 系统 Microsoft Edge WebView2 Runtime 托盘应用和单实例保护，不再内置 Chromium。
 - Vue 3 + TypeScript + Vite + Pinia + Element Plus 现代化界面，支持浅色、深色和跟随系统。
-- 从当前 Codex Home 导入账号；复制后通过第二次 `account/read` 验证邮箱一致才保存。
-- 账号独立保存完整 `CODEX_HOME`，支持改名、删除、打开目录、额度缓存和倒计时。
+- 从当前 Codex Home 导入账号；仅保存 `auth.json`，并通过第二次 `account/read` 验证邮箱一致才落盘。
+- Sessions、历史、插件、Skills 和用户配置共用，账号支持改名、删除、额度缓存和倒计时。
 - 使用官方 `codex app-server` 读取账号和多额度桶，不读取或上传 Token。
-- 切换前检测 Codex 进程，可在确认后关闭进程；通过 HKCU 注册表和 `WM_SETTINGCHANGE` 更新 `CODEX_HOME`。
+- 切换前检测 Codex 进程，可在确认后关闭进程；共享 `CODEX_HOME` 保持不变，仅原子替换登录状态。
 - 配置原子写入、日志滚动与敏感信息脱敏，账号数据卸载时默认保留。
 - GitHub Actions 自动构建 PyInstaller onedir 和 Inno Setup 当前用户安装器。
 
@@ -73,7 +73,7 @@ PyInstaller 使用 `CodexAccountManager.spec`，安装后的机器不需要 Pyth
 
 ## CODEX_HOME 工作机制
 
-应用数据位于 `%LOCALAPPDATA%\CodexAccountManager`：
+旧版本的应用数据位于 `%LOCALAPPDATA%\CodexAccountManager`：
 
 ```text
 config.json
@@ -81,7 +81,17 @@ accounts\<uuid>\codex_home\
 logs\app.log
 ```
 
-每个账号的 `auth.json`、sessions、history 和用户级配置都留在它自己的 Home 中。导入时复制一次，之后切换只将 `CODEX_HOME` 指向目标目录。代码项目目录完全共享，不会被应用复制、删除或切换。
+当前版本改为认证快照目录结构：
+
+```text
+config.json
+accounts\<uuid>\auth.json
+logs\app.log
+```
+
+每个账号只保存一份本机明文 `auth.json` 快照。当前 `CODEX_HOME` 中的 sessions、history、插件、Skills、缓存和用户配置由所有账号共享。切换时应用会先保存当前账号可能已经刷新的认证文件，再通过临时文件、`fsync` 和 `os.replace` 原子替换活动 `auth.json`；二次验证失败会自动恢复原登录状态。
+
+从旧版本升级时，已有 `accounts\<uuid>\codex_home` 会在首次使用该账号时提取为新的认证快照。旧目录在删除该账号前保留，避免自动迁移造成数据丢失。
 
 如果 Codex 使用 Windows Credential Manager 保存凭据，凭据不会随目录复制。请在 Codex 配置中设置：
 
@@ -95,7 +105,7 @@ cli_auth_credentials_store = "file"
 
 这是 100% 本地应用。应用不会将 `auth.json`、Token、JWT、Authorization Header 或 API Key 写入配置、日志、Git 或第三方服务。日志只记录账号 ID、邮箱、Home 路径、App Server 状态和错误摘要，并会对常见敏感字段脱敏。
 
-切换账号不会执行 `codex logout` 或 `account/logout`，也不会改变用户代码项目；它只切换 `CODEX_HOME`。已经打开的 Terminal、IDE 和 VS Code 不会自动更新环境变量，建议重新打开它们，或使用界面中的启动 Codex 按钮。
+切换账号不会执行 `codex logout` 或 `account/logout`，也不会改变用户代码项目；它只原子替换共享 Home 中的活动 `auth.json`。已经运行的 Codex 进程可能缓存旧登录状态，因此切换前必须关闭，并在完成后重新启动。
 
 ## 测试
 

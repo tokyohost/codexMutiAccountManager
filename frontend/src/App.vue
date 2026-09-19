@@ -6,6 +6,8 @@ import {
   Delete,
   Edit,
   FolderOpened,
+  Key,
+  Loading,
   MoreFilled,
   Moon,
   Refresh,
@@ -25,10 +27,29 @@ const renameAccount = ref<Account | null>(null)
 const renameValue = ref('')
 const settingsDraft = reactive<AppSettings>({ ...store.settings })
 const now = ref(Date.now())
+const importing = ref(false)
+const refreshingAll = ref(false)
+const refreshingIds = ref(new Set<string>())
+const switchingId = ref<string | null>(null)
+const removingId = ref<string | null>(null)
+const renaming = ref(false)
+const savingSettings = ref(false)
 let timer: number | undefined
 
 const hasAccounts = computed(() => store.accountCount > 0)
-const busy = computed(() => store.activeTasks.size > 0)
+const busy = computed(() => store.activeTasks.size > 0 || refreshingAll.value)
+const currentAccount = computed(() => store.accounts.find((account) => account.current) ?? null)
+const criticalBusy = computed(() => importing.value || Boolean(switchingId.value) || Boolean(removingId.value))
+const operationText = computed(() => {
+  if (importing.value) return '正在验证并保存当前登录状态…'
+  if (switchingId.value) {
+    const account = store.accounts.find((item) => item.id === switchingId.value)
+    return `正在切换到 ${account?.name ?? '目标账号'}…`
+  }
+  if (removingId.value) return '正在删除登录快照…'
+  if (refreshingAll.value) return '正在依次刷新全部账号额度…'
+  return ''
+})
 
 const statusText: Record<string, string> = {
   idle: '等待刷新',
@@ -89,42 +110,81 @@ function lastRefresh(account: Account): string {
   return new Date(account.lastRefreshAt * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+function accountInitial(account: Account): string {
+  return (account.name || account.email || '?').trim().slice(0, 1).toUpperCase()
+}
+
+function isRefreshing(accountId: string): boolean {
+  return refreshingAll.value || refreshingIds.value.has(accountId)
+}
+
+function setRefreshing(accountId: string, value: boolean): void {
+  const next = new Set(refreshingIds.value)
+  if (value) next.add(accountId)
+  else next.delete(accountId)
+  refreshingIds.value = next
+}
+
+function errorText(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback
+}
+
 async function refreshAll(): Promise<void> {
-  const result = await native.refreshAll()
-  if (result.accepted === false) ElMessage.error(String(result.error ?? '刷新失败'))
-  await store.load(false)
+  if (refreshingAll.value || criticalBusy.value) return
+  refreshingAll.value = true
+  try {
+    const result = await native.refreshAll()
+    if (result.accepted === false) {
+      ElMessage.error(String(result.error ?? '刷新失败'))
+      return
+    }
+    await store.load(false)
+    ElMessage.success('全部账号额度已刷新')
+  } catch (error) {
+    ElMessage.error(errorText(error, '刷新失败，请查看应用日志'))
+  } finally {
+    refreshingAll.value = false
+  }
 }
 
 async function refreshOne(account: Account): Promise<void> {
-  const result = await native.refreshAccount(account.id)
-  if (result.accepted === false) ElMessage.error(String(result.error ?? '刷新失败'))
-  await store.load(false)
+  if (isRefreshing(account.id) || criticalBusy.value) return
+  setRefreshing(account.id, true)
+  try {
+    const result = await native.refreshAccount(account.id)
+    if (result.accepted === false) {
+      ElMessage.error(String(result.error ?? '刷新失败'))
+      return
+    }
+    await store.load(false)
+  } catch (error) {
+    ElMessage.error(errorText(error, '刷新失败，请查看应用日志'))
+  } finally {
+    setRefreshing(account.id, false)
+  }
 }
 
 async function importAccount(): Promise<void> {
-  const result = await native.importCurrentAccount()
-  if (result.accepted === false) {
-    ElMessage.error(String(result.error ?? '导入失败'))
-    return
-  }
-  await store.load(false)
-  const detail = (result.result ?? {}) as { accountId?: string; suggestSwitch?: boolean }
-  const account = store.accounts.find((item) => item.id === detail.accountId)
-  if (account && detail.suggestSwitch) {
-    try {
-      await ElMessageBox.confirm(
-        `账号已导入为「${account.name}」。是否立即将 CODEX_HOME 切换到受管目录？`,
-        '导入完成',
-        { confirmButtonText: '切换到受管目录', cancelButtonText: '稍后再说' },
-      )
-      await switchAccount(account)
-    } catch {
-      // 用户选择稍后切换。
+  if (importing.value) return
+  importing.value = true
+  try {
+    const result = await native.importCurrentAccount()
+    if (result.accepted === false) {
+      ElMessage.error(String(result.error ?? '导入失败'))
+      return
     }
+    await store.load(false)
+    const detail = (result.result ?? {}) as { accountId?: string }
+    const account = store.accounts.find((item) => item.id === detail.accountId)
+    ElMessage.success(account ? `已保存账号：${account.name}` : '账号登录状态已保存')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '导入失败，请查看应用日志')
+  } finally {
+    importing.value = false
   }
 }
 
-async function switchAccount(account: Account, closeCodex = false): Promise<void> {
+async function performSwitch(account: Account, closeCodex = false): Promise<void> {
   const result = await native.switchAccount(account.id, closeCodex)
   if (result.accepted === false) {
     ElMessage.error(String(result.error ?? '切换失败'))
@@ -133,16 +193,16 @@ async function switchAccount(account: Account, closeCodex = false): Promise<void
   const detail = (result.result ?? {}) as { code?: string; success?: boolean; accountId?: string }
   if (detail.code === 'codex_running' && !closeCodex) {
     if (store.settings.autoCloseCodex) {
-      await switchAccount(account, true)
+      await performSwitch(account, true)
       return
     }
     try {
       await ElMessageBox.confirm(
-        'Codex 当前正在运行。切换账号需要先关闭 Codex，否则当前进程会继续使用旧的 CODEX_HOME。',
+        'Codex 当前正在运行。切换账号需要先关闭 Codex，否则当前进程会继续使用旧的登录状态。',
         'Codex 正在运行',
         { type: 'warning', confirmButtonText: '关闭 Codex 并切换', cancelButtonText: '取消' },
       )
-      await switchAccount(account, true)
+      await performSwitch(account, true)
     } catch {
       // 用户取消切换。
     }
@@ -155,19 +215,43 @@ async function switchAccount(account: Account, closeCodex = false): Promise<void
   }
 }
 
+async function switchAccount(account: Account): Promise<void> {
+  if (account.current || criticalBusy.value) return
+  switchingId.value = account.id
+  try {
+    await performSwitch(account)
+  } catch (error) {
+    ElMessage.error(errorText(error, '切换失败，请查看应用日志'))
+  } finally {
+    switchingId.value = null
+  }
+}
+
 async function confirmRemove(account: Account): Promise<void> {
-  if (account.current) return
+  if (account.current || criticalBusy.value) return
   try {
     await ElMessageBox.confirm(
-      `这将删除 Codex Account Manager 保存的完整 CODEX_HOME：\n${account.home}\n\n其中可能包含登录凭据、历史、Sessions 和配置。此操作无法撤销。`,
+      `这将删除 Codex Account Manager 保存的「${account.email}」登录快照。\n\n共享的 Sessions、历史、插件和配置不会被删除。此操作无法撤销。`,
       `删除「${account.name}」？`,
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
     )
-  const result = await native.removeAccount(account.id)
-    if (result.accepted === false) ElMessage.error(String(result.error ?? '删除失败'))
-    else await store.load(false)
   } catch {
     // 用户取消确认框不需要额外提示。
+    return
+  }
+  removingId.value = account.id
+  try {
+    const result = await native.removeAccount(account.id)
+    if (result.accepted === false) {
+      ElMessage.error(String(result.error ?? '删除失败'))
+      return
+    }
+    await store.load(false)
+    ElMessage.success(`已删除：${account.name}`)
+  } catch (error) {
+    ElMessage.error(errorText(error, '删除失败，请查看应用日志'))
+  } finally {
+    removingId.value = null
   }
 }
 
@@ -178,15 +262,22 @@ function showRename(account: Account): void {
 }
 
 async function saveRename(): Promise<void> {
-  if (!renameAccount.value) return
-  const result = await native.renameAccount(renameAccount.value.id, renameValue.value)
-  if (result.accepted === false) {
-    ElMessage.error(String(result.error ?? '修改名称失败'))
-    return
+  if (!renameAccount.value || renaming.value) return
+  renaming.value = true
+  try {
+    const result = await native.renameAccount(renameAccount.value.id, renameValue.value)
+    if (result.accepted === false) {
+      ElMessage.error(String(result.error ?? '修改名称失败'))
+      return
+    }
+    renameVisible.value = false
+    await store.load(false)
+    ElMessage.success('名称已更新')
+  } catch (error) {
+    ElMessage.error(errorText(error, '修改名称失败'))
+  } finally {
+    renaming.value = false
   }
-  renameVisible.value = false
-  await store.load(false)
-  ElMessage.success('名称已更新')
 }
 
 async function copyHome(account: Account): Promise<void> {
@@ -201,10 +292,18 @@ async function openSettings(): Promise<void> {
 }
 
 async function saveSettings(): Promise<void> {
-  await store.saveSettings({ ...settingsDraft })
-  settingsVisible.value = false
-  applyTheme()
-  ElMessage.success('设置已保存')
+  if (savingSettings.value) return
+  savingSettings.value = true
+  try {
+    await store.saveSettings({ ...settingsDraft })
+    settingsVisible.value = false
+    applyTheme()
+    ElMessage.success('设置已保存')
+  } catch (error) {
+    ElMessage.error(errorText(error, '设置保存失败'))
+  } finally {
+    savingSettings.value = false
+  }
 }
 
 async function handleTask(event: TaskEvent): Promise<void> {
@@ -218,16 +317,16 @@ async function handleTask(event: TaskEvent): Promise<void> {
     const account = store.accounts.find((item) => item.id === result.accountId)
     if (!account) return
     if (store.settings.autoCloseCodex) {
-      await switchAccount(account, true)
+      await performSwitch(account, true)
       return
     }
     try {
       await ElMessageBox.confirm(
-        'Codex 当前正在运行。切换账号需要先关闭 Codex，否则当前进程会继续使用旧的 CODEX_HOME。',
+        'Codex 当前正在运行。切换账号需要先关闭 Codex，否则当前进程会继续使用旧的登录状态。',
         'Codex 正在运行',
         { type: 'warning', confirmButtonText: '关闭 Codex 并切换', cancelButtonText: '取消' },
       )
-      await switchAccount(account, true)
+      await performSwitch(account, true)
     } catch {
       // 用户取消切换。
     }
@@ -236,18 +335,7 @@ async function handleTask(event: TaskEvent): Promise<void> {
     if (store.settings.autoStartCodex) await native.startCodex(String(result.accountId))
   } else if (event.taskType === 'import' && result.accountId) {
     const account = store.accounts.find((item) => item.id === result.accountId)
-    if (account && result.suggestSwitch) {
-      try {
-        await ElMessageBox.confirm(
-          `账号已导入为「${account.name}」。是否立即将 CODEX_HOME 切换到受管目录？`,
-          '导入完成',
-          { confirmButtonText: '切换到受管目录', cancelButtonText: '稍后再说' },
-        )
-        await switchAccount(account)
-      } catch {
-        // 用户选择稍后切换。
-      }
-    }
+    ElMessage.success(account ? `已保存账号：${account.name}` : '账号登录状态已保存')
   }
 }
 
@@ -309,10 +397,10 @@ onUnmounted(() => {
         <el-button class="theme-button" text circle title="切换主题" @click="store.saveSettings({ theme: store.settings.theme === 'dark' ? 'light' : 'dark' })">
           <el-icon><Sunny v-if="store.settings.theme !== 'dark'" /><Moon v-else /></el-icon>
         </el-button>
-        <el-button class="ghost-button" :loading="busy" @click="refreshAll">
+        <el-button class="ghost-button" :loading="busy" :disabled="criticalBusy" @click="refreshAll">
           <el-icon><Refresh /></el-icon>刷新全部
         </el-button>
-        <el-button class="primary-button" @click="importAccount">
+        <el-button class="primary-button" :loading="importing" :disabled="criticalBusy || refreshingAll" @click="importAccount">
           <el-icon><Upload /></el-icon>添加当前账号
         </el-button>
       </div>
@@ -323,16 +411,29 @@ onUnmounted(() => {
         <div>
           <div class="section-kicker">ACCOUNTS</div>
           <h2>你的 Codex 账号</h2>
-          <p>每个账号拥有独立的 CODEX_HOME，工作区和代码项目保持不变。</p>
+          <p>账号仅隔离登录状态，Sessions、历史、插件和配置共用当前 CODEX_HOME。</p>
         </div>
-        <div class="account-summary">
-          <span class="summary-dot"></span>
-          <strong>{{ store.accountCount }}</strong>
-          <span>个账号</span>
+        <div class="summary-group">
+          <div v-if="currentAccount" class="current-summary">
+            <span class="summary-label">当前使用</span>
+            <strong>{{ currentAccount.name }}</strong>
+            <span class="summary-email">{{ currentAccount.email }}</span>
+          </div>
+          <div class="account-summary">
+            <span class="summary-dot"></span>
+            <strong>{{ store.accountCount }}</strong>
+            <span>个账号</span>
+          </div>
         </div>
       </section>
 
       <el-alert v-if="store.systemMessage" :title="store.systemMessage" type="warning" show-icon closable />
+      <transition name="operation">
+        <div v-if="operationText" class="operation-strip">
+          <el-icon class="is-loading"><Loading /></el-icon>
+          <div><strong>{{ operationText }}</strong><span>请稍候，操作完成前不要关闭应用</span></div>
+        </div>
+      </transition>
 
       <div v-if="store.loading" class="cards-grid">
         <el-card v-for="item in 2" :key="item" class="account-card skeleton-card" shadow="never">
@@ -343,25 +444,35 @@ onUnmounted(() => {
       <div v-else-if="!hasAccounts" class="empty-state">
         <div class="empty-icon"><SwitchButton /></div>
         <h3>还没有受管账号</h3>
-        <p>从当前 Codex Home 导入第一个账号，之后就可以一键切换和查看额度。</p>
-        <el-button class="primary-button" @click="importAccount"><Upload />添加当前 Codex 账号</el-button>
-        <small>导入会复制一次 CODEX_HOME，并在保存前进行二次账号验证。</small>
+        <p>保存当前 Codex 的登录状态，之后就可以一键切换账号并查看额度。</p>
+        <el-button class="primary-button" :loading="importing" :disabled="criticalBusy" @click="importAccount"><Upload />添加当前 Codex 账号</el-button>
+        <small>仅保存 auth.json 登录快照，不复制 Sessions、插件、缓存或数据库。</small>
       </div>
 
       <div v-else class="cards-grid">
-        <el-card v-for="account in store.accounts" :key="account.id" class="account-card" shadow="never">
+        <el-card
+          v-for="account in store.accounts"
+          :key="account.id"
+          v-loading="removingId === account.id"
+          class="account-card"
+          :class="{ 'is-current': account.current, 'is-switching': switchingId === account.id }"
+          shadow="never"
+        >
           <div class="card-header">
             <div class="account-title">
-              <span class="status-orb" :class="account.status"></span>
+              <div class="account-avatar" :class="{ active: account.current }">
+                {{ accountInitial(account) }}
+                <span class="status-orb" :class="account.status"></span>
+              </div>
               <div>
                 <div class="name-line">
                   <h3>{{ account.name }}</h3>
-                  <el-tag v-if="account.current" class="current-tag" effect="plain" size="small">CURRENT</el-tag>
+                  <el-tag v-if="account.current" class="current-tag" effect="plain" size="small">当前账号</el-tag>
                 </div>
                 <div class="email">{{ account.email }}</div>
               </div>
             </div>
-            <el-dropdown trigger="click">
+            <el-dropdown trigger="click" :disabled="criticalBusy || isRefreshing(account.id)">
               <el-button class="more-button" text circle><el-icon><MoreFilled /></el-icon></el-button>
               <template #dropdown>
                 <el-dropdown-menu>
@@ -370,7 +481,7 @@ onUnmounted(() => {
                   <el-dropdown-item @click="showRename(account)">修改名称</el-dropdown-item>
                   <el-dropdown-item @click="native.openAccountHome(account.id)">打开 CODEX_HOME</el-dropdown-item>
                   <el-dropdown-item @click="copyHome(account)">复制 CODEX_HOME 路径</el-dropdown-item>
-                  <el-dropdown-item divided :disabled="account.current" @click="confirmRemove(account)">删除账号</el-dropdown-item>
+                  <el-dropdown-item divided :disabled="account.current || criticalBusy" @click="confirmRemove(account)">删除账号</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
@@ -395,14 +506,18 @@ onUnmounted(() => {
               </template>
             </div>
           </div>
-          <div v-else class="no-limits">暂无额度缓存，点击刷新获取最新数据</div>
+          <div v-else class="no-limits">
+            <el-icon v-if="isRefreshing(account.id)" class="is-loading"><Loading /></el-icon>
+            <Key v-else />
+            <span>{{ isRefreshing(account.id) ? '正在读取最新额度…' : '暂无额度缓存，刷新后即可查看' }}</span>
+          </div>
 
           <div v-if="account.errorMessage" class="error-note">{{ account.errorMessage }}</div>
           <div class="card-footer">
             <span>最近刷新 {{ lastRefresh(account) }}</span>
             <div class="footer-actions">
-              <el-button text class="small-action" :loading="account.status === 'loading'" @click="refreshOne(account)"><Refresh />刷新</el-button>
-              <el-button v-if="!account.current" class="switch-button" @click="switchAccount(account)">切换到此账号</el-button>
+              <el-button text class="small-action" :loading="isRefreshing(account.id)" :disabled="criticalBusy" @click="refreshOne(account)"><Refresh />刷新</el-button>
+              <el-button v-if="!account.current" class="switch-button" :loading="switchingId === account.id" :disabled="criticalBusy || isRefreshing(account.id)" @click="switchAccount(account)">切换账号</el-button>
               <el-tag v-else class="active-label" effect="plain"><Check />正在使用</el-tag>
             </div>
           </div>
@@ -417,7 +532,7 @@ onUnmounted(() => {
 
     <el-dialog v-model="renameVisible" title="修改账号名称" width="360px">
       <el-input v-model="renameValue" maxlength="80" show-word-limit @keyup.enter="saveRename" />
-      <template #footer><el-button @click="renameVisible = false">取消</el-button><el-button type="primary" @click="saveRename">保存</el-button></template>
+      <template #footer><el-button :disabled="renaming" @click="renameVisible = false">取消</el-button><el-button type="primary" :loading="renaming" @click="saveRename">保存</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="settingsVisible" title="设置" width="480px" class="settings-dialog">
@@ -430,11 +545,11 @@ onUnmounted(() => {
         <div class="setting-controls"><el-switch v-model="settingsDraft.autoRefresh" /><el-select v-model="settingsDraft.refreshIntervalMinutes" :disabled="!settingsDraft.autoRefresh" size="small" style="width: 110px"><el-option v-for="minute in [1, 3, 5, 10]" :key="minute" :label="`${minute} 分钟`" :value="minute" /></el-select></div>
       </div>
       <div class="settings-section"><div class="settings-label"><strong>切换账号时自动关闭 Codex</strong><span>切换前自动结束 Codex 进程</span></div><el-switch v-model="settingsDraft.autoCloseCodex" /></div>
-      <div class="settings-section"><div class="settings-label"><strong>切换成功后启动 Codex</strong><span>使用目标账号的 CODEX_HOME 启动</span></div><el-switch v-model="settingsDraft.autoStartCodex" /></div>
+      <div class="settings-section"><div class="settings-label"><strong>切换成功后启动 Codex</strong><span>使用共享 CODEX_HOME 和新登录状态启动</span></div><el-switch v-model="settingsDraft.autoStartCodex" /></div>
       <div class="settings-section"><div class="settings-label"><strong>关闭窗口时最小化到托盘</strong><span>通过托盘菜单退出应用</span></div><el-switch v-model="settingsDraft.closeToTray" /></div>
       <div class="settings-section"><div class="settings-label"><strong>开机启动</strong><span>仅写入当前用户注册表，无需管理员权限</span></div><el-switch v-model="settingsDraft.startWithWindows" /></div>
       <div class="settings-section"><div class="settings-label"><strong>系统通知</strong><span>显示导入、切换和刷新结果</span></div><el-switch v-model="settingsDraft.showNotifications" /></div>
-      <template #footer><el-button @click="settingsVisible = false">取消</el-button><el-button type="primary" @click="saveSettings">保存设置</el-button></template>
+      <template #footer><el-button :disabled="savingSettings" @click="settingsVisible = false">取消</el-button><el-button type="primary" :loading="savingSettings" @click="saveSettings">保存设置</el-button></template>
     </el-dialog>
   </div>
 </template>

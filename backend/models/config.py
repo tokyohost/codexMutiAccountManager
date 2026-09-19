@@ -61,8 +61,9 @@ class AppSettings:
 class AppConfig:
     """应用持久化配置。"""
 
-    version: int = 1
+    version: int = 2
     current_account: str | None = None
+    shared_home: str = ""
     settings: AppSettings = field(default_factory=AppSettings)
     accounts: list[Account] = field(default_factory=list)
 
@@ -72,6 +73,7 @@ class AppConfig:
         return cls(
             version=int(value.get("version", 1) or 1),
             current_account=value.get("currentAccount"),
+            shared_home=str(value.get("sharedHome", "") or ""),
             settings=AppSettings.from_dict(value.get("settings")),
             accounts=[Account.from_dict(item) for item in value.get("accounts", [])],
         )
@@ -81,7 +83,7 @@ class AppConfig:
         return {
             "version": self.version,
             "currentAccount": self.current_account,
+            "sharedHome": self.shared_home,
             "settings": self.settings.to_dict(),
             "accounts": [account.to_dict() for account in self.accounts],
         }
-

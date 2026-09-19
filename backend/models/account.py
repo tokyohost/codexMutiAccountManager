@@ -18,6 +18,7 @@ class Account:
     plan_type: str = ""
     account_type: str = ""
     home: str = ""
+    auth_path: str = ""
     created_at: int = 0
     last_refresh_at: int | None = None
     last_refresh_result: str | None = None
@@ -35,6 +36,7 @@ class Account:
             plan_type=str(value.get("planType", value.get("plan_type", "")) or ""),
             account_type=str(value.get("type", value.get("accountType", "")) or ""),
             home=str(value.get("home", "")),
+            auth_path=str(value.get("authPath", value.get("auth_path", "")) or ""),
             created_at=int(value.get("createdAt", value.get("created_at", 0)) or 0),
             last_refresh_at=value.get("lastRefreshAt", value.get("last_refresh_at")),
             last_refresh_result=value.get("lastRefreshResult", value.get("last_refresh_result")),
@@ -52,6 +54,7 @@ class Account:
             "planType": self.plan_type,
             "type": self.account_type,
             "home": self.home,
+            "authPath": self.auth_path,
             "createdAt": self.created_at,
             "lastRefreshAt": self.last_refresh_at,
             "lastRefreshResult": self.last_refresh_result,
@@ -60,4 +63,3 @@ class Account:
             "rateLimits": [limit.to_dict() for limit in self.rate_limits],
             "current": current,
         }
-

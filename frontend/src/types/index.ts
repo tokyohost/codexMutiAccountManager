@@ -29,6 +29,7 @@ export interface Account {
   planType?: string
   type?: string
   home: string
+  authPath?: string
   current: boolean
   status: AccountStatus
   errorMessage?: string | null

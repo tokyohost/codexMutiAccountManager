@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import time
 import uuid
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 from backend.models.account import Account
@@ -27,7 +28,7 @@ class AccountServiceError(RuntimeError):
 
 
 class AccountService:
-    """实现账号生命周期，并确保导入后的 Home 独立可用。"""
+    """通过共享 CODEX_HOME 和独立认证快照实现账号生命周期。"""
 
     def __init__(
         self,
@@ -43,6 +44,8 @@ class AccountService:
         self.logger = logger
         self.config: AppConfig = config_service.load()
         self._lock = RLock()
+        self._import_lock = Lock()
+        self._auth_lock = RLock()
 
     def state(self) -> dict[str, Any]:
         """返回前端所需的非敏感完整状态。"""
@@ -75,49 +78,156 @@ class AccountService:
             return self.config.settings.to_dict()
 
     def import_current_account(self) -> dict[str, Any]:
-        """读取当前账号、复制 Home、二次验证后再写入配置。"""
+        """以非阻塞互斥方式导入当前账号，避免重复点击创建并发快照。"""
+        if not self._import_lock.acquire(blocking=False):
+            raise AccountServiceError("当前账号正在导入，请勿重复操作")
+        try:
+            return self._import_current_account()
+        finally:
+            self._import_lock.release()
+
+    def _import_current_account(self) -> dict[str, Any]:
+        """读取当前账号并仅保存 auth.json 登录快照。"""
         source_home = self.environment_service.get_current_home().expanduser().resolve()
         if not source_home.is_dir():
             raise AccountServiceError(f"当前 CODEX_HOME 不存在：{source_home}")
-        source_info = self._read_account(source_home)
-        email = self._email_from(source_info)
-        if not email:
-            raise AccountServiceError("当前 Codex 未登录或 App Server 未返回邮箱")
-        with self._lock:
-            if any(account.email.casefold() == email.casefold() for account in self.config.accounts):
-                raise AccountServiceError("该账号已经添加")
-            if any(self._same_path(account.home, source_home) for account in self.config.accounts):
-                raise AccountServiceError("该 CODEX_HOME 已经添加")
-        account_id = str(uuid.uuid4())
-        account_root = accounts_dir() / account_id
-        temporary_home = account_root / "codex_home.importing"
-        managed_home = account_root / "codex_home"
-        account_root.mkdir(parents=True, exist_ok=False)
-        try:
-            shutil.copytree(source_home, temporary_home)
-            managed_info = self._read_account(temporary_home)
-            if self._email_from(managed_info).casefold() != email.casefold():
-                raise AccountServiceError("导入后二次验证失败：账号邮箱不一致")
-            os.replace(temporary_home, managed_home)
-            now = int(time.time())
-            account = Account(
-                id=account_id,
-                name=self._display_name(email),
-                email=email,
-                plan_type=self._plan_type(source_info),
-                account_type=self._account_type(source_info),
-                home=str(managed_home),
-                created_at=now,
-                status="ready",
-            )
+        with self._auth_lock:
+            shared_home = self._shared_home()
+            if self.config.shared_home and not self._same_path(str(shared_home), source_home):
+                raise AccountServiceError(
+                    f"当前 CODEX_HOME 与账号管理器的共享目录不一致：{shared_home}"
+                )
+            source_info = self._read_account(source_home)
+            email = self._email_from(source_info)
+            if not email:
+                raise AccountServiceError("当前 Codex 未登录或 App Server 未返回邮箱")
             with self._lock:
-                self.config.accounts.append(account)
-                self.config_service.save(self.config)
-            self.logger.info("账号导入成功 id=%s email=%s home=%s", account_id, email, managed_home)
-            return {"accountId": account_id, "email": email, "suggestSwitch": True}
-        except Exception:
-            shutil.rmtree(account_root, ignore_errors=True)
-            raise
+                if any(account.email.casefold() == email.casefold() for account in self.config.accounts):
+                    raise AccountServiceError("该账号已经添加")
+
+            source_auth = source_home / "auth.json"
+            auth_bytes = self._read_auth_bytes(source_auth)
+            account_id = str(uuid.uuid4())
+            account_root = accounts_dir() / account_id
+            snapshot_path = account_root / "auth.json"
+            account_root.mkdir(parents=True, exist_ok=False)
+            previous_current = self.config.current_account
+            previous_shared_home = self.config.shared_home
+            previous_version = self.config.version
+            try:
+                self._atomic_write_bytes(snapshot_path, auth_bytes)
+                managed_info = self._read_snapshot_account(snapshot_path)
+                if self._email_from(managed_info).casefold() != email.casefold():
+                    raise AccountServiceError("导入后二次验证失败：账号邮箱不一致")
+                account = Account(
+                    id=account_id,
+                    name=self._display_name(email),
+                    email=email,
+                    plan_type=self._plan_type(source_info),
+                    account_type=self._account_type(source_info),
+                    home=str(source_home),
+                    auth_path=str(snapshot_path),
+                    created_at=int(time.time()),
+                    status="ready",
+                )
+                with self._lock:
+                    self.config.version = 2
+                    self.config.shared_home = str(source_home)
+                    self.config.current_account = account_id
+                    self.config.accounts.append(account)
+                    try:
+                        self.config_service.save(self.config)
+                    except Exception:
+                        # 配置持久化失败时同步回滚内存，避免留下幽灵账号。
+                        self.config.accounts.remove(account)
+                        self.config.current_account = previous_current
+                        self.config.shared_home = previous_shared_home
+                        self.config.version = previous_version
+                        raise
+                self.logger.info(
+                    "账号认证快照导入成功 id=%s email=%s home=%s", account_id, email, source_home
+                )
+                return {"accountId": account_id, "email": email, "suggestSwitch": False}
+            except Exception:
+                shutil.rmtree(account_root, ignore_errors=True)
+                raise
+
+    def _read_snapshot_account(self, snapshot_path: Path) -> dict[str, Any]:
+        """在临时最小 Home 中验证认证快照，不接触活动 auth.json。"""
+        temporary_home = snapshot_path.parent / f"verify-{uuid.uuid4().hex}"
+        try:
+            temporary_home.mkdir(parents=True, exist_ok=False)
+            self._atomic_write_bytes(temporary_home / "auth.json", self._read_auth_bytes(snapshot_path))
+            self._write_file_credential_config(temporary_home)
+            info = self._read_account(temporary_home)
+            refreshed_auth = temporary_home / "auth.json"
+            if refreshed_auth.is_file():
+                self._atomic_write_bytes(snapshot_path, self._read_auth_bytes(refreshed_auth))
+            return info
+        finally:
+            shutil.rmtree(temporary_home, ignore_errors=True)
+
+    @staticmethod
+    def _read_auth_bytes(path: Path) -> bytes:
+        """读取并校验 auth.json 的基本结构，但不记录其中的敏感内容。"""
+        if not path.is_file():
+            raise AccountServiceError(
+                f"未找到登录文件：{path}；请设置 cli_auth_credentials_store = \"file\" 后重新登录"
+            )
+        try:
+            data = path.read_bytes()
+            value = json.loads(data.decode("utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AccountServiceError(f"登录文件不可读取或格式错误：{path}") from exc
+        if not isinstance(value, dict) or not value:
+            raise AccountServiceError("登录文件内容无效，请重新登录 Codex")
+        return data
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        """在目标目录内通过临时文件和原子替换写入认证快照。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _shared_home(self) -> Path:
+        """返回全账号共用的活动 CODEX_HOME。"""
+        if self.config.shared_home:
+            return Path(self.config.shared_home).expanduser().resolve()
+        return self.environment_service.get_current_home().expanduser().resolve()
+
+    def _write_file_credential_config(self, home: Path) -> None:
+        """为临时验证 Home 强制指定文件凭据，避免系统 Keyring 串号。"""
+        self._atomic_write_bytes(
+            home / "config.toml", b'cli_auth_credentials_store = "file"\n'
+        )
+
+    def _snapshot_path(self, account: Account, migrate: bool = True) -> Path:
+        """返回账号认证快照路径，并按需兼容迁移旧版完整 Home。"""
+        if account.auth_path:
+            return Path(account.auth_path).expanduser().resolve()
+        legacy_auth = Path(account.home).expanduser().resolve() / "auth.json"
+        if not migrate:
+            return legacy_auth
+        snapshot_path = accounts_dir() / account.id / "auth.json"
+        self._atomic_write_bytes(snapshot_path, self._read_auth_bytes(legacy_auth))
+        account.auth_path = str(snapshot_path)
+        account.home = str(self._shared_home())
+        self.config.version = 2
+        self.config.shared_home = account.home
+        self.config_service.save(self.config)
+        self.logger.info("旧版账号已迁移为认证快照 id=%s", account.id)
+        return snapshot_path
 
     def refresh_account(self, account_id: str) -> dict[str, Any]:
         """刷新一个账号的额度并缓存非敏感结果。"""
@@ -126,9 +236,34 @@ class AccountService:
             account.status = "loading"
             account.error_message = None
         try:
-            with CodexAppServerClient(account.home, self.logger) as client:
-                info = client.read_account()
-                limits = client.read_rate_limits()
+            with self._auth_lock:
+                shared_home = self._shared_home()
+                temporary_home: Path | None = None
+                snapshot_path = self._snapshot_path(account)
+                if self.config.current_account == account.id:
+                    operation_home = shared_home
+                else:
+                    temporary_home = snapshot_path.parent / f"refresh-{uuid.uuid4().hex}"
+                    temporary_home.mkdir(parents=True, exist_ok=False)
+                    self._atomic_write_bytes(
+                        temporary_home / "auth.json", self._read_auth_bytes(snapshot_path)
+                    )
+                    self._write_file_credential_config(temporary_home)
+                    operation_home = temporary_home
+                try:
+                    with CodexAppServerClient(str(operation_home), self.logger) as client:
+                        info = client.read_account()
+                        limits = client.read_rate_limits()
+                    if self._email_from(info).casefold() != account.email.casefold():
+                        raise AccountServiceError("额度刷新返回了其他账号，已拒绝更新认证快照")
+                    refreshed_auth = operation_home / "auth.json"
+                    if refreshed_auth.is_file():
+                        self._atomic_write_bytes(
+                            snapshot_path, self._read_auth_bytes(refreshed_auth)
+                        )
+                finally:
+                    if temporary_home is not None:
+                        shutil.rmtree(temporary_home, ignore_errors=True)
             with self._lock:
                 account.plan_type = self._plan_type(info) or account.plan_type
                 account.rate_limits = self._parse_rate_limits(limits)
@@ -155,20 +290,71 @@ class AccountService:
         return {"results": results}
 
     def switch_account(self, account_id: str, close_codex: bool = False) -> dict[str, Any]:
-        """切换注册表 CODEX_HOME，必要时先关闭 Codex 进程。"""
+        """原子替换共享 Home 的 auth.json，失败时恢复原登录状态。"""
         account = self._find(account_id)
+        if self.config.current_account == account_id:
+            return {"success": True, "accountId": account_id, "home": str(self._shared_home())}
         running = self.process_service.find_codex_processes()
         if running and not close_codex:
             return {"success": False, "code": "codex_running", "accountId": account_id}
         if running and not self.process_service.close_codex():
             return {"success": False, "code": "close_failed", "message": "无法关闭正在运行的 Codex"}
-        home = Path(account.home)
-        if not home.is_dir():
-            raise AccountServiceError(f"账号 CODEX_HOME 不存在：{home}")
-        self.environment_service.set_home(home)
-        with self._lock:
-            self.config.current_account = account_id
-            self.config_service.save(self.config)
+        with self._auth_lock:
+            home = self._shared_home()
+            if not home.is_dir():
+                raise AccountServiceError(f"共享 CODEX_HOME 不存在：{home}")
+            live_auth = home / "auth.json"
+            original_auth = self._read_auth_bytes(live_auth) if live_auth.is_file() else None
+            target_auth = self._read_auth_bytes(self._snapshot_path(account))
+            previous_current = self.config.current_account
+            previous_shared_home = self.config.shared_home
+            previous_version = self.config.version
+            previous_account_home = account.home
+
+            # 切走前先采纳 Codex 可能已经轮换的 Token，但必须确认活动文件仍属于当前账号。
+            if previous_current and original_auth is not None:
+                try:
+                    current = self._find(previous_current)
+                    live_info = self._read_account(home)
+                    if self._email_from(live_info).casefold() == current.email.casefold():
+                        original_auth = self._read_auth_bytes(live_auth)
+                        self._atomic_write_bytes(self._snapshot_path(current), original_auth)
+                    else:
+                        self.logger.warning("活动登录与当前账号不一致，跳过旧账号认证同步")
+                except Exception as exc:
+                    self.logger.warning("切换前同步当前账号认证失败，继续使用已有快照：%s", exc)
+
+            try:
+                self._atomic_write_bytes(live_auth, target_auth)
+                target_info = self._read_account(home)
+                if self._email_from(target_info).casefold() != account.email.casefold():
+                    raise AccountServiceError(
+                        "切换后二次验证失败：账号邮箱不一致；请确认 "
+                        'cli_auth_credentials_store = "file"'
+                    )
+                self._atomic_write_bytes(
+                    self._snapshot_path(account), self._read_auth_bytes(live_auth)
+                )
+                self.environment_service.set_home(home)
+                with self._lock:
+                    self.config.version = 2
+                    self.config.shared_home = str(home)
+                    self.config.current_account = account_id
+                    account.home = str(home)
+                    try:
+                        self.config_service.save(self.config)
+                    except Exception:
+                        self.config.current_account = previous_current
+                        self.config.shared_home = previous_shared_home
+                        self.config.version = previous_version
+                        account.home = previous_account_home
+                        raise
+            except Exception:
+                if original_auth is None:
+                    live_auth.unlink(missing_ok=True)
+                else:
+                    self._atomic_write_bytes(live_auth, original_auth)
+                raise
         self.logger.info("账号切换成功 id=%s email=%s home=%s", account.id, account.email, home)
         return {"success": True, "accountId": account_id, "home": str(home)}
 
@@ -184,12 +370,17 @@ class AccountService:
         return {"accountId": account_id, "name": account.name}
 
     def remove_account(self, account_id: str) -> dict[str, Any]:
-        """删除非当前账号及其完整 CODEX_HOME。"""
+        """删除非当前账号的认证快照与旧版遗留目录。"""
         with self._lock:
             if self.config.current_account == account_id:
                 raise AccountServiceError("当前账号不能删除，请先切换到其他账号")
             account = self._find(account_id)
-            account_root = Path(account.home).expanduser().resolve().parent
+            snapshot_path = self._snapshot_path(account, migrate=False)
+            account_root = (
+                snapshot_path.parent
+                if account.auth_path
+                else Path(account.home).expanduser().resolve().parent
+            )
             managed_root = accounts_dir().resolve()
             if managed_root not in account_root.parents:
                 raise AccountServiceError("账号目录不在应用管理范围内，已拒绝删除")
@@ -201,17 +392,19 @@ class AccountService:
         return {"accountId": account_id}
 
     def start_codex(self, account_id: str | None = None) -> dict[str, Any]:
-        """以目标账号 Home 启动 Codex，避免继承旧终端环境。"""
+        """使用共享 Home 启动当前账号的 Codex。"""
         account_id = account_id or self.config.current_account
         if not account_id:
             raise AccountServiceError("尚未选择当前账号")
         account = self._find(account_id)
+        if self.config.current_account != account.id:
+            raise AccountServiceError("目标账号尚未切换为当前账号")
         executable = resolve_codex_executable()
         if not executable:
             raise AccountServiceError("未找到 Codex CLI，请确认已安装 Codex；应用已自动检查 PATH、npm 全局目录和常见安装目录")
         self.logger.info("使用 Codex CLI：%s", executable)
         env = os.environ.copy()
-        env["CODEX_HOME"] = account.home
+        env["CODEX_HOME"] = str(self._shared_home())
         import subprocess
 
         subprocess.Popen([executable], env=env, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
