@@ -6,12 +6,12 @@ import json
 import logging
 import os
 import queue
-import shutil
 import subprocess
 import threading
 import time
 from typing import Any
 
+from backend.services.codex_locator import resolve_codex_executable
 from backend.utils.logger import redact
 from backend.utils.windows import hidden_process_flags
 
@@ -35,9 +35,10 @@ class CodexAppServerClient:
 
     def start(self) -> None:
         """启动 App Server 并完成 initialize。"""
-        executable = os.environ.get("CODEX_EXECUTABLE") or shutil.which("codex")
+        executable = resolve_codex_executable()
         if not executable:
-            raise CodexAppServerError("未找到 codex 命令，请确认 Codex 已安装并加入 PATH")
+            raise CodexAppServerError("未找到 Codex CLI，请确认已安装 Codex；应用已自动检查 PATH、npm 全局目录和常见安装目录")
+        self.logger.info("使用 Codex CLI：%s", executable)
         env = os.environ.copy()
         env["CODEX_HOME"] = self.home
         try:
@@ -162,4 +163,3 @@ class CodexAppServerClient:
     def __exit__(self, *_: object) -> None:
         """离开 with 代码块时关闭客户端。"""
         self.close()
-

@@ -18,7 +18,8 @@ Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管�
 - Windows 10/11
 - Python 3.12+
 - Node.js 22+
-- 已安装并登录 Codex CLI，且 `codex` 在 PATH 中
+- 已安装并登录 Codex CLI；应用会自动检查 PATH、npm 全局目录和常见 Windows 安装目录，无需手动配置 PATH
+- 也支持 OpenAI Codex Desktop 的 `%LOCALAPPDATA%\OpenAI\Codex\bin\<版本>\codex.exe` 安装方式
 - Windows 10/11 建议安装 Microsoft Edge WebView2 Runtime（大多数系统已预装）
 - Inno Setup 6（仅打包安装器需要）
 

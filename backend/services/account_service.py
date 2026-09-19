@@ -15,6 +15,7 @@ from backend.models.account import Account
 from backend.models.config import AppConfig
 from backend.models.rate_limit import RateLimit, RateLimitWindow
 from backend.services.codex_app_server import CodexAppServerClient, CodexAppServerError
+from backend.services.codex_locator import resolve_codex_executable
 from backend.services.config_service import ConfigService
 from backend.services.environment_service import EnvironmentService
 from backend.services.process_service import ProcessService
@@ -205,9 +206,10 @@ class AccountService:
         if not account_id:
             raise AccountServiceError("尚未选择当前账号")
         account = self._find(account_id)
-        executable = os.environ.get("CODEX_EXECUTABLE") or shutil.which("codex")
+        executable = resolve_codex_executable()
         if not executable:
-            raise AccountServiceError("未找到 codex 命令")
+            raise AccountServiceError("未找到 Codex CLI，请确认已安装 Codex；应用已自动检查 PATH、npm 全局目录和常见安装目录")
+        self.logger.info("使用 Codex CLI：%s", executable)
         env = os.environ.copy()
         env["CODEX_HOME"] = account.home
         import subprocess
