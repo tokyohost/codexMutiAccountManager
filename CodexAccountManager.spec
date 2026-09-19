@@ -7,6 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 
 project_root = Path(SPECPATH)
+application_entry = project_root / "backend" / "main.py"
 frontend_dist = project_root / "frontend" / "dist"
 resources = project_root / "resources"
 icon_path = resources / "app.ico"
@@ -24,7 +25,7 @@ hiddenimports = [
 ]
 
 a = Analysis(
-    [str(project_root / "main.py")],
+    [str(application_entry)],
     pathex=[str(project_root)],
     binaries=[],
     datas=datas,
