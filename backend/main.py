@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-import sys
-
-from PySide6.QtWidgets import QApplication
-
-from backend.app import AppController
+from backend.web_app import WebAppController
 
 
 def main() -> None:
-    """创建 Qt 应用并进入事件循环。"""
-    application = QApplication(sys.argv)
-    application.setApplicationName("Codex Account Manager")
-    application.setApplicationDisplayName("Codex Account Manager")
-    application.setOrganizationName("CodexAccountManager")
-    controller = AppController(application)
-    if not controller.start():
-        return
-    sys.exit(application.exec())
+    """创建 WebView2 应用并进入消息循环。"""
+    WebAppController().run()
 
+
+if __name__ == "__main__":
+    main()

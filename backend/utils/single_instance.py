@@ -2,42 +2,35 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+import ctypes
+import os
+
+from backend.services.task_service import EventHook
 
 
-class SingleInstanceGuard(QObject):
-    """使用 QLocalServer 保证同一用户只运行一个实例。"""
+class SingleInstanceGuard:
+    """使用 Windows 命名互斥量保证同一用户只运行一个实例。"""
 
-    activateRequested = Signal()
+    _ERROR_ALREADY_EXISTS = 183
 
     def __init__(self, name: str) -> None:
-        """保存本地服务器名称。"""
-        super().__init__()
+        """保存互斥量名称并初始化状态。"""
         self.name = name
-        self.server = QLocalServer(self)
+        self.activateRequested = EventHook()
+        self._mutex = None
 
     def acquire(self) -> bool:
-        """尝试获取实例；已有实例时请求其显示窗口并返回 False。"""
-        if self.server.listen(self.name):
-            self.server.newConnection.connect(self._on_connection)
+        """尝试获取互斥量；已有实例时返回 False。"""
+        if os.name != "nt":
             return True
-        socket = QLocalSocket()
-        socket.connectToServer(self.name)
-        if socket.waitForConnected(500):
-            socket.write(b"show\n")
-            socket.flush()
-            socket.waitForBytesWritten(200)
-            socket.disconnectFromServer()
+        self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, self.name)
+        if ctypes.windll.kernel32.GetLastError() == self._ERROR_ALREADY_EXISTS:
+            self.release()
             return False
-        QLocalServer.removeServer(self.name)
-        return self.server.listen(self.name)
+        return True
 
-    def _on_connection(self) -> None:
-        """处理第二实例发送的显示请求。"""
-        socket = self.server.nextPendingConnection()
-        if socket:
-            socket.waitForReadyRead(200)
-            self.activateRequested.emit()
-            socket.disconnectFromServer()
-
+    def release(self) -> None:
+        """释放当前进程持有的互斥量。"""
+        if self._mutex:
+            ctypes.windll.kernel32.CloseHandle(self._mutex)
+            self._mutex = None

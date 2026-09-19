@@ -2,8 +2,7 @@
 """PyInstaller onedir 构建配置。"""
 
 from pathlib import Path
-
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH)
@@ -17,12 +16,8 @@ if frontend_dist.exists():
     datas.append((str(frontend_dist), "frontend/dist"))
 if resources.exists():
     datas.append((str(resources), "resources"))
-datas += collect_data_files("PySide6")
-hiddenimports = [
-    "PySide6.QtWebEngineWidgets",
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebChannel",
-]
+datas += collect_data_files("webview")
+hiddenimports = ["pystray._win32", "PIL.Image"] + collect_submodules("webview")
 
 a = Analysis(
     [str(application_entry)],
@@ -36,6 +31,17 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+
+def should_keep_binary(entry):
+    """过滤当前 Windows x64 应用不会使用的可选二进制组件。"""
+    destination = entry[0].replace("\\", "/").lower()
+    if destination.startswith("pil/"):
+        return Path(destination).name.startswith("_imaging.cp")
+    return True
+
+
+a.binaries = [entry for entry in a.binaries if should_keep_binary(entry)]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

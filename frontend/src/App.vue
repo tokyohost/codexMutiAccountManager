@@ -92,21 +92,67 @@ function lastRefresh(account: Account): string {
 async function refreshAll(): Promise<void> {
   const result = await native.refreshAll()
   if (result.accepted === false) ElMessage.error(String(result.error ?? '刷新失败'))
+  await store.load(false)
 }
 
 async function refreshOne(account: Account): Promise<void> {
   const result = await native.refreshAccount(account.id)
   if (result.accepted === false) ElMessage.error(String(result.error ?? '刷新失败'))
+  await store.load(false)
 }
 
 async function importAccount(): Promise<void> {
   const result = await native.importCurrentAccount()
-  if (result.accepted === false) ElMessage.error(String(result.error ?? '导入失败'))
+  if (result.accepted === false) {
+    ElMessage.error(String(result.error ?? '导入失败'))
+    return
+  }
+  await store.load(false)
+  const detail = (result.result ?? {}) as { accountId?: string; suggestSwitch?: boolean }
+  const account = store.accounts.find((item) => item.id === detail.accountId)
+  if (account && detail.suggestSwitch) {
+    try {
+      await ElMessageBox.confirm(
+        `账号已导入为「${account.name}」。是否立即将 CODEX_HOME 切换到受管目录？`,
+        '导入完成',
+        { confirmButtonText: '切换到受管目录', cancelButtonText: '稍后再说' },
+      )
+      await switchAccount(account)
+    } catch {
+      // 用户选择稍后切换。
+    }
+  }
 }
 
 async function switchAccount(account: Account, closeCodex = false): Promise<void> {
   const result = await native.switchAccount(account.id, closeCodex)
-  if (result.accepted === false) ElMessage.error(String(result.error ?? '切换失败'))
+  if (result.accepted === false) {
+    ElMessage.error(String(result.error ?? '切换失败'))
+    return
+  }
+  const detail = (result.result ?? {}) as { code?: string; success?: boolean; accountId?: string }
+  if (detail.code === 'codex_running' && !closeCodex) {
+    if (store.settings.autoCloseCodex) {
+      await switchAccount(account, true)
+      return
+    }
+    try {
+      await ElMessageBox.confirm(
+        'Codex 当前正在运行。切换账号需要先关闭 Codex，否则当前进程会继续使用旧的 CODEX_HOME。',
+        'Codex 正在运行',
+        { type: 'warning', confirmButtonText: '关闭 Codex 并切换', cancelButtonText: '取消' },
+      )
+      await switchAccount(account, true)
+    } catch {
+      // 用户取消切换。
+    }
+    return
+  }
+  await store.load(false)
+  if (detail.success) {
+    ElMessage.success(`已切换到：${account.name}`)
+    if (store.settings.autoStartCodex) await native.startCodex(account.id)
+  }
 }
 
 async function confirmRemove(account: Account): Promise<void> {
@@ -117,8 +163,9 @@ async function confirmRemove(account: Account): Promise<void> {
       `删除「${account.name}」？`,
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
     )
-    const result = await native.removeAccount(account.id)
+  const result = await native.removeAccount(account.id)
     if (result.accepted === false) ElMessage.error(String(result.error ?? '删除失败'))
+    else await store.load(false)
   } catch {
     // 用户取消确认框不需要额外提示。
   }
@@ -138,6 +185,7 @@ async function saveRename(): Promise<void> {
     return
   }
   renameVisible.value = false
+  await store.load(false)
   ElMessage.success('名称已更新')
 }
 
@@ -233,7 +281,10 @@ onMounted(async () => {
   native.on('notification', handleNotification)
   await store.load()
   applyTheme()
-  timer = window.setInterval(() => { now.value = Date.now() }, 1000)
+  timer = window.setInterval(() => {
+    now.value = Date.now()
+    void store.load(false)
+  }, 2000)
 })
 
 onUnmounted(() => {

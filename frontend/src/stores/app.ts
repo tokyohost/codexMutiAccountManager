@@ -30,8 +30,8 @@ export const useAppStore = defineStore('app', () => {
     loading.value = false
   }
 
-  async function load(): Promise<void> {
-    loading.value = true
+  async function load(showLoading = true): Promise<void> {
+    if (showLoading) loading.value = true
     applyState(await native.getAppState())
   }
 

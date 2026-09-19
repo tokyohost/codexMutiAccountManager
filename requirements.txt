@@ -1,2 +1,4 @@
-PySide6>=6.8,<7
 psutil>=6.1,<7
+Pillow>=10.0,<12
+pystray>=0.19,<1
+pywebview>=5.4,<7

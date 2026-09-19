@@ -1,9 +1,8 @@
 import type { AppState, AppSettings, TaskEvent } from '@/types'
 
 type NativeSignal = { connect: (callback: (value: string) => void) => void }
-type NativeObject = {
-  [key: string]: ((...args: unknown[]) => void) | NativeSignal
-}
+type NativeFunction = (...args: unknown[]) => unknown
+type NativeObject = { [key: string]: NativeFunction | NativeSignal }
 
 const mockState: AppState = {
   currentAccount: null,
@@ -22,6 +21,7 @@ const mockState: AppState = {
 }
 
 let bridge: NativeObject | null = null
+let qtBridge = false
 const listeners = new Map<string, Array<(payload: string) => void>>()
 
 function parseResult(value: string | undefined): Record<string, unknown> {
@@ -47,10 +47,15 @@ function getMockResult(method: string, args: unknown[]): string {
 export const native = {
   async connect(): Promise<void> {
     if (bridge) return
+    if (window.pywebview?.api) {
+      bridge = window.pywebview.api as NativeObject
+      return
+    }
     if (window.qt?.webChannelTransport && window.QWebChannel) {
       await new Promise<void>((resolve) => {
         new window.QWebChannel!(window.qt!.webChannelTransport, (channel) => {
           bridge = channel.objects.appBridge as NativeObject
+          qtBridge = true
           for (const [name, callbacks] of listeners) {
             const signal = bridge[name] as NativeSignal | undefined
             signal?.connect((value) => callbacks.forEach((callback) => callback(value)))
@@ -67,6 +72,10 @@ export const native = {
     await this.connect()
     const target = bridge?.[method]
     if (typeof target !== 'function') return parseResult(getMockResult(method, args)) as T
+    if (!qtBridge) {
+      const value = await target(...args)
+      return (typeof value === 'string' ? parseResult(value) : value) as T
+    }
     return new Promise<T>((resolve) => {
       target(...args, (value: string) => resolve(parseResult(value) as T))
     })
@@ -76,7 +85,7 @@ export const native = {
     const callbacks = listeners.get(signal) ?? []
     callbacks.push(callback)
     listeners.set(signal, callbacks)
-    if (bridge?.[signal] && typeof bridge[signal] !== 'function') {
+    if (qtBridge && bridge?.[signal] && typeof bridge[signal] !== 'function') {
       ;(bridge[signal] as NativeSignal).connect(callback)
     }
   },

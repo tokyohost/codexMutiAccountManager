@@ -4,7 +4,7 @@ Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管�
 
 ## 特性
 
-- PySide6 托盘应用、单实例、QWebEngineView 和 QWebChannel。
+- pywebview + 系统 Microsoft Edge WebView2 Runtime 托盘应用和单实例保护，不再内置 Chromium。
 - Vue 3 + TypeScript + Vite + Pinia + Element Plus 现代化界面，支持浅色、深色和跟随系统。
 - 从当前 Codex Home 导入账号；复制后通过第二次 `account/read` 验证邮箱一致才保存。
 - 账号独立保存完整 `CODEX_HOME`，支持改名、删除、打开目录、额度缓存和倒计时。
@@ -19,6 +19,7 @@ Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管�
 - Python 3.12+
 - Node.js 22+
 - 已安装并登录 Codex CLI，且 `codex` 在 PATH 中
+- Windows 10/11 建议安装 Microsoft Edge WebView2 Runtime（大多数系统已预装）
 - Inno Setup 6（仅打包安装器需要）
 
 安装依赖：
@@ -66,6 +67,8 @@ release/CodexAccountManager-1.0.0-Setup-x64.exe
 ```
 
 PyInstaller 使用 `CodexAccountManager.spec`，安装后的机器不需要 Python、Node 或 npm。GitHub Actions 的 `build.yml` 在 push、pull request 和手动触发时上传 Installer artifact；推送 `v1.0.0` 形式的 tag 会由 `release.yml` 创建 GitHub Release，并同时发布 `SHA256SUMS.txt`。
+
+普通分支构建完成后不会自动创建 Release；发布时请先提交代码，再执行 `git tag v1.0.0` 和 `git push origin v1.0.0`。
 
 ## CODEX_HOME 工作机制
 
