@@ -1,0 +1,2931 @@
+# Codex Account Manager
+
+请帮我完整开发一个 Windows 桌面托盘应用：
+
+**Codex Account Manager**
+
+用于管理多个 ChatGPT Plus / Codex 登录账号，实现：
+
+```text
+Account A → CODEX_HOME=A
+Account B → CODEX_HOME=B
+Account C → CODEX_HOME=C
+```
+
+用户可以查看多个账号的 Codex 使用额度、刷新时间、当前账号，并可以一键切换账号。
+
+项目需要直接做到可以运行、打包、通过 GitHub Actions 发布 Windows Installer。
+
+不要只提供伪代码。
+
+---
+
+# 一、总体架构
+
+采用：
+
+```text
+Python
+    ↓
+PySide6
+    ↓
+QSystemTrayIcon              Windows 系统托盘
+QWebEngineView               内嵌 Vue3 页面
+QWebChannel                  Vue3 ↔ Python IPC
+    ↓
+Vue3 + TypeScript + Vite
+    ↓
+现代化账号管理 UI
+```
+
+系统层全部由 Python 实现：
+
+```text
+Codex 进程管理
+CODEX_HOME 管理
+Windows 注册表环境变量
+Codex App Server
+文件复制
+账号导入
+额度读取
+日志
+```
+
+UI 层全部使用 Vue3。
+
+不要使用 PySide6 原生 QWidget 去绘制主要业务界面。
+
+PySide6 原生界面只用于：
+
+```text
+系统托盘
+主窗口容器
+QWebEngineView
+必要的原生确认框
+```
+
+主界面全部由 Vue3 实现。
+
+---
+
+# 二、技术栈
+
+## Python 后端
+
+使用：
+
+```text
+Python 3.12+
+
+PySide6
+PySide6.QtWebEngineWidgets
+PySide6.QtWebChannel
+psutil
+pathlib
+subprocess
+shutil
+json
+logging
+winreg
+ctypes
+uuid
+```
+
+第三方 Python 依赖尽量只保留：
+
+```text
+PySide6
+psutil
+```
+
+开发依赖：
+
+```text
+pytest
+pyinstaller
+```
+
+---
+
+## Vue 前端
+
+使用：
+
+```text
+Vue 3
+TypeScript
+Vite
+Pinia
+Element Plus
+```
+
+图标优先：
+
+```text
+@element-plus/icons-vue
+```
+
+不要依赖 CDN。
+
+所有 JS / CSS / Font / SVG 必须本地打包。
+
+不需要 Axios，因为 Vue 与 Python 不是通过 HTTP 通信，而是通过：
+
+```text
+QWebChannel
+```
+
+---
+
+# 三、不要启动本地 HTTP Server
+
+不要设计：
+
+```text
+Python
+ ↓
+Flask / FastAPI
+ ↓
+localhost:xxxx
+ ↓
+Vue
+```
+
+这个项目不需要 Web Server。
+
+正确方案：
+
+```text
+QWebEngineView
+      ↓
+加载本地 Vue dist/index.html
+      ↓
+QWebChannel
+      ↓
+Python QObject Bridge
+```
+
+Vue 编译后：
+
+```text
+frontend/dist/
+```
+
+Vite 配置：
+
+```ts
+export default defineConfig({
+  base: './'
+})
+```
+
+Python 使用：
+
+```python
+QUrl.fromLocalFile(...)
+```
+
+加载：
+
+```text
+frontend/dist/index.html
+```
+
+这样：
+
+* 不监听 TCP 端口
+* 不需要 Flask
+* 不需要 FastAPI
+* 不存在端口冲突
+* 不暴露本地接口
+* 安装后直接运行
+
+---
+
+# 四、Vue 与 Python 通信
+
+使用：
+
+```text
+QWebChannel
+```
+
+Python 创建：
+
+```text
+AppBridge(QObject)
+```
+
+并注册：
+
+```text
+window.appBridge
+```
+
+Vue 使用：
+
+```text
+qrc:///qtwebchannel/qwebchannel.js
+```
+
+连接 Python。
+
+建议封装：
+
+```text
+frontend/src/services/native.ts
+```
+
+Vue 页面不能直接到处调用 `window.appBridge`。
+
+统一封装：
+
+```ts
+native.getAppState()
+native.getAccounts()
+native.importCurrentAccount()
+native.switchAccount(id)
+native.refreshAccount(id)
+native.refreshAll()
+native.renameAccount(id, name)
+native.removeAccount(id)
+native.openAccountHome(id)
+native.openLogs()
+native.getSettings()
+native.saveSettings()
+```
+
+复杂数据建议统一使用 JSON 字符串：
+
+```text
+Python
+ ↓
+json.dumps()
+ ↓
+QWebChannel
+ ↓
+Vue JSON.parse()
+```
+
+这样避免 Qt 类型映射产生额外问题。
+
+---
+
+# 五、异步任务设计
+
+任何可能耗时的操作都绝对不能阻塞 Qt GUI 主线程。
+
+例如：
+
+```text
+复制 CODEX_HOME
+启动 codex app-server
+读取额度
+终止 Codex
+刷新全部账号
+```
+
+都必须使用：
+
+```text
+QThreadPool
+QRunnable
+```
+
+或者独立 QThread。
+
+推荐：
+
+```text
+TaskManager
+```
+
+统一管理后台任务。
+
+Python Bridge 发出事件：
+
+```text
+taskStarted
+taskProgress
+taskCompleted
+taskFailed
+
+accountChanged
+accountUpdated
+rateLimitsUpdated
+```
+
+Vue 根据这些事件更新 Pinia Store。
+
+不要使用：
+
+```python
+while True
+```
+
+跑在 UI 主线程。
+
+---
+
+# 六、程序数据目录
+
+所有程序数据统一存储在：
+
+```text
+%LOCALAPPDATA%\CodexAccountManager\
+```
+
+例如：
+
+```text
+C:\Users\xxx\AppData\Local\CodexAccountManager\
+```
+
+目录：
+
+```text
+CodexAccountManager\
+│
+├── config.json
+│
+├── logs\
+│   └── app.log
+│
+├── accounts\
+│   ├── <UUID-A>\
+│   │   └── codex_home\
+│   │       ├── auth.json
+│   │       ├── config.toml
+│   │       ├── history.jsonl
+│   │       ├── sessions\
+│   │       └── ...
+│   │
+│   ├── <UUID-B>\
+│   │   └── codex_home\
+│   │
+│   └── <UUID-C>\
+│       └── codex_home\
+│
+└── cache\
+```
+
+每个账号独占完整：
+
+```text
+CODEX_HOME
+```
+
+绝对不要让账号共享：
+
+```text
+auth.json
+sessions
+history.jsonl
+```
+
+---
+
+# 七、核心切换原则
+
+这是整个软件最重要的原则。
+
+禁止：
+
+```text
+Account A
+  ↓
+copy
+  ↓
+%USERPROFILE%\.codex
+
+Account B
+  ↓
+copy overwrite
+  ↓
+%USERPROFILE%\.codex
+```
+
+不要每次切换账号时复制目录。
+
+正确方式：
+
+```text
+Account A
+ ↓
+CODEX_HOME=C:\...\accounts\A\codex_home
+
+
+Account B
+ ↓
+CODEX_HOME=C:\...\accounts\B\codex_home
+```
+
+也就是说：
+
+**账号导入时复制一次。**
+
+之后：
+
+**永久直接使用该账号自己的 CODEX_HOME。**
+
+---
+
+# 八、工作区共享
+
+多个 Codex 账号只隔离 Codex Home。
+
+实际项目目录完全共享。
+
+例如：
+
+```text
+D:\workspace\my-project
+```
+
+无论使用：
+
+```text
+Plus A
+Plus B
+Plus C
+```
+
+都是同一个：
+
+```text
+D:\workspace\my-project
+```
+
+所以：
+
+```text
+.git
+branch
+commit
+uncommitted changes
+src
+pom.xml
+package.json
+AGENTS.md
+```
+
+全部共享。
+
+只有下面这些隔离：
+
+```text
+Codex 登录凭据
+Codex session
+Codex history
+Codex 用户级配置
+Codex 使用额度
+```
+
+---
+
+# 九、config.json
+
+示例：
+
+```json
+{
+  "version": 1,
+  "currentAccount": "uuid-a",
+  "settings": {
+    "autoRefresh": true,
+    "refreshIntervalMinutes": 3,
+    "startWithWindows": false,
+    "minimizeToTray": true,
+    "closeToTray": true
+  },
+  "accounts": [
+    {
+      "id": "uuid-a",
+      "name": "个人 Plus",
+      "email": "aaa@example.com",
+      "planType": "plus",
+      "home": "C:\\Users\\xxx\\AppData\\Local\\CodexAccountManager\\accounts\\uuid-a\\codex_home",
+      "createdAt": 1234567890,
+      "lastRefreshAt": 1234567890
+    }
+  ]
+}
+```
+
+禁止保存：
+
+```text
+accessToken
+refreshToken
+auth.json 内容
+```
+
+到 config.json。
+
+---
+
+# 十、配置文件写入必须原子化
+
+不要直接：
+
+```python
+open("config.json", "w")
+```
+
+然后覆盖。
+
+使用：
+
+```text
+config.json.tmp
+ ↓
+flush
+ ↓
+os.replace
+ ↓
+config.json
+```
+
+避免程序崩溃导致 config.json 损坏。
+
+程序启动时如果检测 config.json 损坏：
+
+```text
+不要崩溃
+```
+
+应：
+
+```text
+备份损坏文件
+重新生成配置
+显示错误提示
+```
+
+---
+
+# 十一、导入当前 Codex 账号
+
+Vue 提供：
+
+```text
++ 添加当前 Codex 账号
+```
+
+点击执行。
+
+## 第一步
+
+确定当前 Codex Home。
+
+优先：
+
+```text
+当前进程 CODEX_HOME
+```
+
+然后：
+
+```text
+Windows HKCU Environment\CODEX_HOME
+```
+
+如果都没有：
+
+```text
+%USERPROFILE%\.codex
+```
+
+---
+
+## 第二步
+
+检查目录是否存在。
+
+---
+
+## 第三步
+
+使用当前 Home 启动：
+
+```text
+codex app-server
+```
+
+环境变量：
+
+```text
+CODEX_HOME=<current_home>
+```
+
+调用：
+
+```text
+account/read
+```
+
+获取：
+
+```text
+type
+email
+planType
+```
+
+只接受正常已登录的 ChatGPT Codex 账号。
+
+---
+
+# 十二、第一次导入账号
+
+创建：
+
+```text
+accounts\<uuid>\codex_home
+```
+
+然后：
+
+```text
+当前 Codex Home
+       ↓
+shutil.copytree
+       ↓
+新的 Managed CODEX_HOME
+```
+
+这里只复制一次。
+
+---
+
+# 十三、导入完成后必须进行二次验证
+
+这一点非常重要。
+
+复制完成后：
+
+```text
+不要直接认为导入成功
+```
+
+需要使用：
+
+```text
+CODEX_HOME=<新的 managed home>
+```
+
+重新启动：
+
+```text
+codex app-server
+```
+
+再调用：
+
+```text
+account/read
+```
+
+确认：
+
+```text
+email
+```
+
+和原始账号一致。
+
+只有验证通过：
+
+```text
+才真正写入 config.json
+```
+
+如果验证失败：
+
+```text
+删除临时导入目录
+不要保存账号
+提示用户
+```
+
+---
+
+# 十四、凭据存储模式
+
+Codex 可能使用：
+
+```text
+file
+keyring
+auto
+ephemeral
+```
+
+项目最适合：
+
+```toml
+cli_auth_credentials_store = "file"
+```
+
+此时认证保存在：
+
+```text
+CODEX_HOME\auth.json
+```
+
+如果导入后新 CODEX_HOME 无法读取账号，很可能当前账号使用了：
+
+```text
+Windows Credential Manager
+```
+
+这种情况下不要尝试读取 Windows Credential Manager 的 Token。
+
+显示提示：
+
+```text
+当前 Codex 登录凭据没有随 CODEX_HOME 一起迁移。
+
+建议将 Codex 设置为：
+
+cli_auth_credentials_store = "file"
+
+重新登录 Codex 后再次导入。
+```
+
+不要自动破解、导出或打印 Credential Manager 中的 Token。
+
+---
+
+# 十五、首次导入成功后的处理
+
+假设用户原本使用：
+
+```text
+%USERPROFILE%\.codex
+```
+
+成功导入后：
+
+```text
+accounts\UUID-A\codex_home
+```
+
+应该询问用户：
+
+```text
+是否将当前 Codex 切换到由 Codex Account Manager 管理的账号目录？
+```
+
+默认推荐：
+
+```text
+是
+```
+
+之后：
+
+```text
+CODEX_HOME=<managed home>
+```
+
+这样以后 Token 自动刷新、session、history 全部直接写到 Managed Home。
+
+原来的：
+
+```text
+%USERPROFILE%\.codex
+```
+
+不再作为活动账号使用。
+
+---
+
+# 十六、重复账号检测
+
+以：
+
+```text
+email
+```
+
+作为主要重复检测依据。
+
+如果 email 已存在：
+
+```text
+该账号已经添加
+```
+
+同时也检测：
+
+```text
+CODEX_HOME realpath
+```
+
+避免同一个 Home 被重复添加。
+
+---
+
+# 十七、Codex App Server
+
+使用官方：
+
+```text
+codex app-server
+```
+
+Python 创建：
+
+```text
+CodexAppServerClient
+```
+
+负责：
+
+```text
+start
+initialize
+request
+response
+notification
+timeout
+shutdown
+kill
+```
+
+---
+
+# 十八、App Server JSON-RPC
+
+启动：
+
+```python
+env = os.environ.copy()
+env["CODEX_HOME"] = account_home
+```
+
+然后：
+
+```python
+subprocess.Popen(
+    ["codex", "app-server"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    encoding="utf-8",
+    env=env
+)
+```
+
+初始化：
+
+```json
+{
+  "method": "initialize",
+  "id": 1,
+  "params": {
+    "clientInfo": {
+      "name": "codex_account_manager",
+      "title": "Codex Account Manager",
+      "version": "1.0.0"
+    }
+  }
+}
+```
+
+不要依赖 experimental API。
+
+---
+
+# 十九、读取账号
+
+调用：
+
+```text
+account/read
+```
+
+参数：
+
+```json
+{
+  "refreshToken": false
+}
+```
+
+需要读取：
+
+```text
+account.type
+account.email
+account.planType
+requiresOpenaiAuth
+```
+
+---
+
+# 二十、读取额度
+
+调用：
+
+```text
+account/rateLimits/read
+```
+
+优先处理：
+
+```text
+rateLimitsByLimitId
+```
+
+因为可能存在多个额度桶。
+
+兼容旧结构：
+
+```text
+rateLimits
+```
+
+每一个额度窗口读取：
+
+```text
+limitId
+limitName
+
+primary.usedPercent
+primary.windowDurationMins
+primary.resetsAt
+
+secondary.usedPercent
+secondary.windowDurationMins
+secondary.resetsAt
+
+rateLimitReachedType
+```
+
+Vue 展示：
+
+```text
+usedPercent
+
+remainingPercent = max(0, 100 - usedPercent)
+
+resetsAt
+
+windowDurationMins
+```
+
+---
+
+# 二十一、额度 UI
+
+不要写死：
+
+```text
+5小时
+周额度
+```
+
+应该根据：
+
+```text
+windowDurationMins
+```
+
+生成可读名称。
+
+例如：
+
+```text
+300 mins → 5 小时额度
+10080 mins → 7 天额度
+```
+
+如果服务器提供：
+
+```text
+limitName
+```
+
+优先使用服务器名称。
+
+---
+
+# 二十二、刷新时间
+
+`resetsAt` 是 Unix Timestamp。
+
+Vue 显示：
+
+```text
+今天 16:30
+```
+
+并同时显示倒计时：
+
+```text
+2小时31分钟后刷新
+```
+
+倒计时本身：
+
+```text
+前端每秒计算
+```
+
+不要每秒调用后端。
+
+---
+
+# 二十三、额度刷新
+
+支持：
+
+```text
+刷新当前账号
+刷新单个账号
+刷新全部账号
+```
+
+刷新全部：
+
+```text
+A
+ ↓
+app-server
+ ↓
+读取
+ ↓
+关闭
+
+B
+ ↓
+app-server
+ ↓
+读取
+ ↓
+关闭
+
+C
+ ↓
+app-server
+ ↓
+读取
+ ↓
+关闭
+```
+
+默认顺序刷新。
+
+不要同时启动十几个：
+
+```text
+codex app-server
+```
+
+---
+
+# 二十四、额度缓存
+
+内存中缓存：
+
+```text
+lastRateLimits
+lastRefreshAt
+lastRefreshResult
+```
+
+也可以把非敏感额度信息写入：
+
+```text
+config.json
+```
+
+这样应用刚启动时可以立即展示：
+
+```text
+上次刷新结果
+```
+
+然后后台重新获取。
+
+---
+
+# 二十五、自动刷新
+
+配置：
+
+```text
+1分钟
+3分钟
+5分钟
+10分钟
+关闭
+```
+
+默认：
+
+```text
+3分钟
+```
+
+使用：
+
+```text
+QTimer
+```
+
+触发后台任务。
+
+不能阻塞主线程。
+
+---
+
+# 二十六、账号切换
+
+用户点击：
+
+```text
+切换到该账号
+```
+
+例如：
+
+```text
+Plus B
+```
+
+执行：
+
+```text
+Account B
+ ↓
+CODEX_HOME=B
+```
+
+---
+
+# 二十七、切换前检测 Codex
+
+使用：
+
+```text
+psutil
+```
+
+检测 Codex 相关进程。
+
+不要只简单：
+
+```text
+process.name() == codex.exe
+```
+
+需要兼容：
+
+```text
+codex.exe
+Codex.exe
+可能的 Codex Desktop / CLI 子进程
+```
+
+但不要误杀：
+
+```text
+VS Code
+IDEA
+Terminal
+```
+
+---
+
+# 二十八、Codex 正在运行时
+
+Vue 显示漂亮的确认 Dialog：
+
+```text
+Codex 当前正在运行
+
+切换账号需要先关闭 Codex，否则当前进程仍然会继续使用旧的 CODEX_HOME。
+
+[取消]
+
+[关闭 Codex 并切换]
+```
+
+这里：
+
+**关闭 Codex 是关闭进程。**
+
+绝对不能：
+
+```bash
+codex logout
+```
+
+不要调用：
+
+```text
+account/logout
+```
+
+因为我们只是切账号，并不是注销账号。
+
+---
+
+# 二十九、修改 CODEX_HOME
+
+修改：
+
+```text
+HKEY_CURRENT_USER\Environment
+```
+
+键：
+
+```text
+CODEX_HOME
+```
+
+值：
+
+```text
+目标账号 home
+```
+
+使用：
+
+```text
+winreg
+```
+
+写入。
+
+然后调用 Windows：
+
+```text
+WM_SETTINGCHANGE
+```
+
+广播：
+
+```text
+Environment
+```
+
+---
+
+# 三十、切换成功
+
+更新：
+
+```json
+currentAccount
+```
+
+Vue 立即刷新。
+
+提示：
+
+```text
+已切换到：个人 Plus
+
+新的 CODEX_HOME：
+
+C:\...\accounts\xxx\codex_home
+
+请重新启动 Codex。
+```
+
+---
+
+# 三十一、增加可选按钮
+
+切换完成后提供：
+
+```text
+[完成]
+
+[启动 Codex]
+```
+
+如果点击：
+
+```text
+启动 Codex
+```
+
+Python 可以直接：
+
+```python
+env = os.environ.copy()
+env["CODEX_HOME"] = target_home
+```
+
+然后启动 Codex。
+
+这样即使父级 Terminal 没刷新环境变量：
+
+```text
+也能确保启动的新 Codex 使用正确账号
+```
+
+这个按钮属于增强功能，但建议实现。
+
+---
+
+# 三十二、注意 Windows 环境变量继承
+
+修改：
+
+```text
+HKCU\Environment
+```
+
+不会修改已经运行的：
+
+```text
+PowerShell
+CMD
+Windows Terminal
+VS Code
+IDEA
+```
+
+这些进程的 Environment。
+
+所以界面必须说明：
+
+```text
+如果你从已经打开的 Terminal 或 IDE 启动 Codex，
+可能仍然继承旧 CODEX_HOME。
+
+建议重新打开 Terminal / IDE，
+或者直接使用本软件的“启动 Codex”按钮。
+```
+
+---
+
+# 三十三、主窗口
+
+应用启动后：
+
+```text
+默认只显示系统托盘
+```
+
+双击托盘：
+
+```text
+打开管理窗口
+```
+
+主窗口尺寸例如：
+
+```text
+960 x 680
+```
+
+支持缩放。
+
+---
+
+# 三十四、Vue3 UI 风格
+
+界面不要做成传统 Windows 工具软件。
+
+希望风格接近：
+
+```text
+ChatGPT Desktop
+GitHub Desktop
+Raycast
+Linear
+Vercel Dashboard
+```
+
+特点：
+
+```text
+简洁
+现代
+圆角
+轻阴影
+足够留白
+信息密度适中
+```
+
+支持：
+
+```text
+Light
+Dark
+System
+```
+
+默认：
+
+```text
+System
+```
+
+---
+
+# 三十五、主页面布局
+
+顶部：
+
+```text
+Codex Account Manager
+
+3 Accounts
+
+[刷新全部] [+ 添加当前账号]
+```
+
+下面：
+
+```text
+Account Cards
+```
+
+账号卡片：
+
+```text
+┌──────────────────────────────────────┐
+│ ● 个人 Plus                CURRENT   │
+│ aaa@example.com                      │
+│ Plus                                 │
+│                                      │
+│ 5小时额度                            │
+│ ███████████████░░░░░  剩余 74%       │
+│ 2小时31分钟后刷新                    │
+│                                      │
+│ 7天额度                              │
+│ █████████░░░░░░░░░░░  剩余 43%       │
+│ 3天8小时后刷新                       │
+│                                      │
+│ 最近刷新：13:42                      │
+│                                      │
+│ [刷新]                [更多 ⋯]       │
+└──────────────────────────────────────┘
+```
+
+非当前账号显示：
+
+```text
+[切换到此账号]
+```
+
+---
+
+# 三十六、状态颜色
+
+例如：
+
+```text
+> 50% remaining
+正常
+
+20%-50%
+提醒
+
+<20%
+警告
+
+0%
+已耗尽
+```
+
+颜色不要硬编码到组件里。
+
+使用：
+
+```text
+CSS Variables
+```
+
+统一主题系统。
+
+---
+
+# 三十七、Skeleton
+
+加载额度时不要让界面跳动。
+
+使用：
+
+```text
+Element Plus Skeleton
+```
+
+或者自定义 Skeleton。
+
+刷新按钮显示：
+
+```text
+loading
+```
+
+但其他账号仍然可以正常操作。
+
+---
+
+# 三十八、账号菜单
+
+每个账号：
+
+```text
+⋯
+```
+
+菜单：
+
+```text
+切换到此账号
+刷新额度
+修改名称
+打开 CODEX_HOME
+复制 CODEX_HOME 路径
+删除账号
+```
+
+当前账号：
+
+```text
+删除账号
+```
+
+应禁用。
+
+---
+
+# 三十九、删除账号
+
+显示确认：
+
+```text
+删除「个人 Plus」？
+
+这将删除 Codex Account Manager 保存的完整 CODEX_HOME：
+
+C:\...\accounts\xxx\codex_home
+
+其中可能包含：
+
+• 登录凭据
+• Codex 历史
+• Sessions
+• 配置
+
+此操作无法撤销。
+```
+
+当前账号不允许删除。
+
+必须先切到其他账号。
+
+---
+
+# 四十、托盘
+
+使用：
+
+```text
+QSystemTrayIcon
+```
+
+托盘右键：
+
+```text
+Codex Account Manager
+-------------------------
+
+✓ 个人 Plus
+  工作 Plus
+  备用 Plus
+
+-------------------------
+
+打开管理器
+刷新所有额度
+添加当前账号
+
+-------------------------
+
+退出
+```
+
+点击账号：
+
+```text
+直接开始切换流程
+```
+
+双击托盘：
+
+```text
+打开主窗口
+```
+
+单击关闭窗口：
+
+默认：
+
+```text
+隐藏到托盘
+```
+
+不要退出程序。
+
+---
+
+# 四十一、设置页面
+
+Vue 添加 Settings。
+
+包含：
+
+```text
+主题
+
+额度自动刷新间隔
+
+开机启动
+
+关闭窗口时最小化到托盘
+
+切换账号时自动关闭 Codex
+
+切换成功后自动启动 Codex
+
+显示系统通知
+```
+
+---
+
+# 四十二、开机启动
+
+使用 Windows：
+
+```text
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+不要要求管理员权限。
+
+---
+
+# 四十三、日志
+
+使用：
+
+```text
+RotatingFileHandler
+```
+
+文件：
+
+```text
+%LOCALAPPDATA%\CodexAccountManager\logs\app.log
+```
+
+最多例如：
+
+```text
+5MB × 3
+```
+
+日志允许记录：
+
+```text
+account id
+email
+CODEX_HOME
+app-server start/stop
+rate limit query result status
+switch result
+exception stack
+```
+
+绝对禁止记录：
+
+```text
+auth.json
+Authorization Header
+access token
+refresh token
+JWT
+API Key
+```
+
+如果 stderr 包含疑似 token：
+
+```text
+必须做日志脱敏
+```
+
+---
+
+# 四十四、Codex App Server stderr
+
+stdout：
+
+```text
+JSON-RPC
+```
+
+stderr：
+
+```text
+日志
+```
+
+必须分别读取。
+
+防止：
+
+```text
+PIPE buffer blocked
+```
+
+导致 app-server 卡死。
+
+App Server 请求必须有 Timeout，例如：
+
+```text
+10 秒
+```
+
+超时以后：
+
+```text
+terminate
+ ↓
+wait
+ ↓
+kill
+```
+
+---
+
+# 四十五、异常处理
+
+必须处理：
+
+```text
+codex 未安装
+codex 不在 PATH
+CODEX_HOME 不存在
+CODEX_HOME 无权限
+auth.json 不存在
+账号未登录
+凭据位于 keyring
+app-server 启动失败
+JSON-RPC 超时
+JSON-RPC 返回 error
+网络不可用
+额度接口不可用
+账号 token 失效
+目录复制失败
+config.json 损坏
+Windows 注册表写入失败
+Codex 进程无法关闭
+账号目录被占用
+```
+
+单个账号刷新失败：
+
+```text
+不能导致整个程序崩溃
+```
+
+---
+
+# 四十六、账号错误状态
+
+Account Card 支持：
+
+```text
+正常
+刷新中
+未登录
+认证失效
+网络错误
+Codex 不可用
+未知错误
+```
+
+例如认证失效：
+
+```text
+认证已失效
+
+请重新登录此 Codex 账号。
+
+[打开此账号 Codex]
+```
+
+---
+
+# 四十七、Python 项目结构
+
+建议：
+
+```text
+codex-account-manager/
+│
+├── backend/
+│   ├── main.py
+│   ├── app.py
+│   │
+│   ├── bridge/
+│   │   └── app_bridge.py
+│   │
+│   ├── models/
+│   │   ├── account.py
+│   │   └── rate_limit.py
+│   │
+│   ├── services/
+│   │   ├── account_service.py
+│   │   ├── config_service.py
+│   │   ├── codex_service.py
+│   │   ├── codex_app_server.py
+│   │   ├── environment_service.py
+│   │   ├── process_service.py
+│   │   ├── startup_service.py
+│   │   └── task_service.py
+│   │
+│   ├── utils/
+│   │   ├── paths.py
+│   │   ├── logger.py
+│   │   ├── json_utils.py
+│   │   └── windows.py
+│   │
+│   └── resources/
+│       ├── app.ico
+│       └── tray.ico
+│
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── views/
+│   │   ├── stores/
+│   │   ├── services/
+│   │   │   └── native.ts
+│   │   ├── types/
+│   │   ├── styles/
+│   │   ├── App.vue
+│   │   └── main.ts
+│   │
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── tsconfig.json
+│
+├── installer/
+│   └── installer.iss
+│
+├── scripts/
+│   ├── build_frontend.ps1
+│   ├── build_backend.ps1
+│   └── build_installer.ps1
+│
+├── tests/
+│
+├── .github/
+│   └── workflows/
+│       ├── build.yml
+│       └── release.yml
+│
+├── CodexAccountManager.spec
+├── requirements.txt
+├── requirements-dev.txt
+├── README.md
+└── VERSION
+```
+
+---
+
+# 四十八、PyInstaller
+
+因为使用：
+
+```text
+PySide6
+QtWebEngine
+Vue dist
+```
+
+**不要优先使用 PyInstaller `--onefile`。**
+
+推荐：
+
+```text
+PyInstaller --onedir
+```
+
+得到：
+
+```text
+dist\
+└── CodexAccountManager\
+    ├── CodexAccountManager.exe
+    ├── Qt6...
+    ├── resources...
+    └── frontend...
+```
+
+然后由：
+
+```text
+Inno Setup
+```
+
+把整个目录封装成：
+
+```text
+CodexAccountManager-Setup-x64.exe
+```
+
+最终用户仍然只需要下载一个 Installer EXE。
+
+这种方式比：
+
+```text
+PyInstaller --onefile + QtWebEngine
+```
+
+启动更快，也更稳定。
+
+---
+
+# 四十九、PyInstaller Spec
+
+必须提供：
+
+```text
+CodexAccountManager.spec
+```
+
+正确收集：
+
+```text
+PySide6 QtWebEngine
+QtWebEngineProcess
+translations
+resources
+frontend/dist
+icons
+```
+
+必须确保安装后的机器：
+
+```text
+没有 Python
+没有 Node
+没有 npm
+```
+
+也能直接运行。
+
+---
+
+# 五十、Vue Build
+
+构建顺序：
+
+```text
+cd frontend
+
+npm ci
+
+npm run build
+```
+
+产生：
+
+```text
+frontend/dist
+```
+
+然后：
+
+```text
+PyInstaller
+```
+
+把 dist 一起打进去。
+
+---
+
+# 五十一、Node
+
+GitHub Actions 使用：
+
+```text
+Node.js 22
+```
+
+不要依赖开发电脑已有 Node。
+
+使用：
+
+```text
+npm ci
+```
+
+而不是：
+
+```text
+npm install
+```
+
+保证 CI 可复现。
+
+提交：
+
+```text
+package-lock.json
+```
+
+---
+
+# 五十二、Windows Installer
+
+使用：
+
+```text
+Inno Setup
+```
+
+生成：
+
+```text
+CodexAccountManager-Setup-x64.exe
+```
+
+安装目录：
+
+```text
+%LOCALAPPDATA%\Programs\CodexAccountManager
+```
+
+推荐：
+
+```text
+Current User
+```
+
+安装。
+
+默认：
+
+```text
+不要求管理员权限
+```
+
+---
+
+# 五十三、Installer 功能
+
+需要：
+
+```text
+安装应用
+开始菜单快捷方式
+桌面快捷方式可选
+卸载程序
+升级覆盖安装
+卸载时结束正在运行的程序
+```
+
+Installer 不允许删除：
+
+```text
+%LOCALAPPDATA%\CodexAccountManager\accounts
+```
+
+也就是说卸载软件：
+
+```text
+默认保留账号数据
+```
+
+卸载可以询问：
+
+```text
+是否同时删除所有 Codex Account Manager 数据？
+```
+
+默认：
+
+```text
+否
+```
+
+---
+
+# 五十四、版本号
+
+根目录：
+
+```text
+VERSION
+```
+
+例如：
+
+```text
+1.0.0
+```
+
+Python：
+
+```text
+App Version
+```
+
+Vue：
+
+```text
+About 页面
+```
+
+PyInstaller：
+
+```text
+exe metadata
+```
+
+Inno Setup：
+
+```text
+AppVersion
+```
+
+GitHub Release：
+
+```text
+v1.0.0
+```
+
+必须保持一致。
+
+---
+
+# 五十五、GitHub Actions Build
+
+提供：
+
+```text
+.github/workflows/build.yml
+```
+
+触发：
+
+```text
+push
+pull_request
+workflow_dispatch
+```
+
+运行：
+
+```text
+windows-latest
+```
+
+步骤：
+
+```text
+checkout
+
+setup Python 3.12
+
+pip install requirements
+
+setup Node 22
+
+npm ci
+
+npm run build
+
+pytest
+
+PyInstaller
+
+安装 / 调用 Inno Setup
+
+生成 Installer
+
+upload-artifact
+```
+
+上传：
+
+```text
+CodexAccountManager-Setup-x64.exe
+```
+
+---
+
+# 五十六、GitHub Actions Release
+
+提供：
+
+```text
+.github/workflows/release.yml
+```
+
+触发：
+
+```text
+git tag
+```
+
+格式：
+
+```text
+v*
+```
+
+例如：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+自动：
+
+```text
+Build Vue
+ ↓
+Build Python
+ ↓
+PyInstaller
+ ↓
+Inno Setup
+ ↓
+CodexAccountManager-Setup-x64.exe
+ ↓
+GitHub Release
+```
+
+Release 附件：
+
+```text
+CodexAccountManager-Setup-x64.exe
+```
+
+同时生成：
+
+```text
+SHA256SUMS.txt
+```
+
+记录 Installer SHA256。
+
+---
+
+# 五十七、GitHub Actions 权限
+
+release workflow 设置：
+
+```yaml
+permissions:
+  contents: write
+```
+
+正常 build workflow：
+
+```yaml
+permissions:
+  contents: read
+```
+
+尽量遵循最小权限原则。
+
+---
+
+# 五十八、Installer 文件名
+
+格式：
+
+```text
+CodexAccountManager-1.0.0-Setup-x64.exe
+```
+
+不要：
+
+```text
+setup.exe
+```
+
+---
+
+# 五十九、未来自动更新预留
+
+第一版不强制实现自动更新。
+
+但是代码架构预留：
+
+```text
+UpdateService
+```
+
+未来可以通过：
+
+```text
+GitHub Releases API
+```
+
+检测：
+
+```text
+latest release
+```
+
+显示：
+
+```text
+发现新版本 1.2.0
+
+[查看更新]
+[下载并安装]
+```
+
+第一版可以只实现：
+
+```text
+检查更新
+```
+
+不自动静默安装。
+
+---
+
+# 六十、应用图标
+
+必须支持：
+
+```text
+EXE Icon
+Installer Icon
+Window Icon
+Tray Icon
+```
+
+统一：
+
+```text
+app.ico
+```
+
+Tray 可以单独：
+
+```text
+tray.ico
+```
+
+---
+
+# 六十一、主窗口行为
+
+点击：
+
+```text
+X
+```
+
+默认：
+
+```text
+隐藏到托盘
+```
+
+真正退出只能：
+
+```text
+Tray → 退出
+```
+
+设置中可以修改：
+
+```text
+关闭窗口直接退出
+```
+
+---
+
+# 六十二、单实例
+
+应用必须单实例运行。
+
+不能启动：
+
+```text
+CodexAccountManager.exe
+CodexAccountManager.exe
+CodexAccountManager.exe
+```
+
+多个进程。
+
+建议：
+
+```text
+QLocalServer / QLocalSocket
+```
+
+或者 Windows Mutex。
+
+第二个实例启动：
+
+```text
+通知第一个实例打开主窗口
+ ↓
+自身退出
+```
+
+---
+
+# 六十三、安全要求
+
+这是重点。
+
+永远不要：
+
+```text
+把 auth.json 上传
+把 auth.json 放进 Git
+打印 auth.json
+读取并显示 token
+发送 token 到自己的服务器
+```
+
+这个应用应该：
+
+```text
+100% Local
+```
+
+不需要自己的后端服务器。
+
+除了：
+
+```text
+Codex 自己的网络请求
+GitHub 更新检查
+```
+
+不要访问任何第三方 API。
+
+---
+
+# 六十四、.gitignore
+
+必须包含：
+
+```text
+auth.json
+.codex
+accounts/
+dist/
+build/
+node_modules/
+frontend/dist/
+*.log
+__pycache__/
+*.spec.bak
+```
+
+程序运行目录的数据绝对不能进 Git。
+
+---
+
+# 六十五、README
+
+README 必须说明：
+
+```text
+项目用途
+
+架构
+
+开发环境
+
+Python 安装
+
+Node 安装
+
+Vue 开发
+
+如何运行
+
+如何 Build
+
+如何生成 Installer
+
+CODEX_HOME 工作机制
+
+如何导入账号
+
+凭据 file/keyring 区别
+
+GitHub Actions 发布方法
+
+安全说明
+```
+
+并写清楚：
+
+```text
+切换账号不会修改用户的代码项目。
+
+它只是切换 CODEX_HOME。
+```
+
+---
+
+# 六十六、开发模式
+
+开发环境支持：
+
+```text
+npm run dev
+```
+
+为了方便开发，可以允许：
+
+```text
+CODEX_MANAGER_DEV_URL=http://localhost:5173
+```
+
+如果环境变量存在：
+
+```text
+QWebEngineView
+ ↓
+localhost:5173
+```
+
+生产环境：
+
+```text
+frontend/dist/index.html
+```
+
+注意：
+
+**只有开发模式使用 Vite Dev Server。**
+
+Production Installer 绝对不能启动 HTTP Server。
+
+---
+
+# 六十七、前端 Store
+
+Pinia 建议：
+
+```text
+appStore
+accountStore
+settingsStore
+```
+
+Account：
+
+```ts
+interface Account {
+  id: string
+  name: string
+  email: string
+  planType?: string
+  home: string
+
+  current: boolean
+
+  status:
+    | 'idle'
+    | 'loading'
+    | 'ready'
+    | 'auth_error'
+    | 'network_error'
+    | 'error'
+
+  rateLimits: RateLimit[]
+  lastRefreshAt?: number
+}
+```
+
+---
+
+# 六十八、Python 模型
+
+使用：
+
+```text
+dataclasses
+```
+
+例如：
+
+```text
+Account
+RateLimit
+RateLimitWindow
+AppSettings
+AppConfig
+```
+
+不要在 Service 里到处传裸 dict。
+
+---
+
+# 六十九、AppBridge 设计
+
+建议公开：
+
+```text
+getAppState()
+
+importCurrentAccount()
+
+switchAccount(accountId)
+
+refreshAccount(accountId)
+
+refreshAllAccounts()
+
+renameAccount(accountId, name)
+
+removeAccount(accountId)
+
+openAccountHome(accountId)
+
+openLogsDirectory()
+
+getSettings()
+
+updateSettings(json)
+
+quitApplication()
+```
+
+信号：
+
+```text
+stateChanged(json)
+
+accountUpdated(json)
+
+accountsChanged(json)
+
+taskEvent(json)
+
+notification(json)
+```
+
+---
+
+# 七十、不要做的事情
+
+不要：
+
+```text
+用 Flask
+用 FastAPI
+开 localhost API
+
+用 Electron
+
+每次切账号复制 .codex
+
+执行 codex logout
+
+执行 account/logout
+
+读取 Token 内容
+
+上传用户认证数据
+
+阻塞 UI 主线程
+
+使用 while true 轮询
+
+同时启动大量 app-server
+
+硬编码额度窗口名称
+
+把开发 Vue server 带进生产包
+
+PyInstaller 优先 onefile
+```
+
+---
+
+# 七十一、最终产品流程
+
+用户第一次安装：
+
+```text
+安装 Codex Account Manager
+        ↓
+启动
+        ↓
+检测当前 Codex
+        ↓
+「添加当前 Codex 账号」
+        ↓
+account/read
+        ↓
+复制当前 CODEX_HOME
+        ↓
+二次 account/read 验证
+        ↓
+加入账号 A
+        ↓
+CODEX_HOME → Managed A
+```
+
+然后用户登录第二个 Codex Plus 账号并导入：
+
+```text
+Account B
+```
+
+最终：
+
+```text
+Codex Account Manager
+
+Account A
+个人 Plus
+CODEX_HOME=A
+额度 68%
+
+Account B
+工作 Plus
+CODEX_HOME=B
+额度 91%
+```
+
+点击：
+
+```text
+切换到 Account B
+```
+
+执行：
+
+```text
+检测 Codex
+ ↓
+关闭 Codex
+ ↓
+HKCU CODEX_HOME=B
+ ↓
+WM_SETTINGCHANGE
+ ↓
+currentAccount=B
+ ↓
+完成
+```
+
+然后用户：
+
+```text
+重新启动 Codex
+```
+
+或者：
+
+```text
+点击「启动 Codex」
+```
+
+即可使用账号 B。
+
+整个过程中：
+
+```text
+D:\workspace\my-project
+```
+
+完全不变。
+
+---
+
+# 七十二、第一版必须真正完成
+
+请直接完成一个可以运行和发布的 V1，不要停留在架构设计或 Demo。
+
+必须完成：
+
+```text
+Python + PySide6 Shell
+
+系统托盘
+
+单实例
+
+QWebEngineView
+
+QWebChannel
+
+Vue3 + TypeScript + Vite
+
+Element Plus UI
+
+Light / Dark Theme
+
+Account Card
+
+导入当前 Codex
+
+多 CODEX_HOME 管理
+
+导入后二次认证验证
+
+切换账号
+
+修改 HKCU CODEX_HOME
+
+WM_SETTINGCHANGE
+
+检测 / 关闭 Codex
+
+Codex App Server Client
+
+account/read
+
+account/rateLimits/read
+
+多 Rate Limit 展示
+
+额度刷新倒计时
+
+后台定时刷新
+
+QThreadPool 后台任务
+
+账号改名
+
+账号删除
+
+打开 Home
+
+Settings 页面
+
+日志与脱敏
+
+异常处理
+
+requirements.txt
+
+package.json
+
+README.md
+
+PyInstaller spec
+
+Inno Setup installer.iss
+
+GitHub Actions build.yml
+
+GitHub Actions release.yml
+
+SHA256 release 文件
+```
+
+完成后需要实际检查：
+
+```text
+npm run build
+pytest
+PyInstaller build
+```
+
+并修复构建中发现的问题。
+
+最终项目必须做到：
+
+```text
+git clone
+ ↓
+按照 README 操作
+ ↓
+可以本地运行
+
+git tag v1.0.0
+ ↓
+GitHub Actions
+ ↓
+自动生成
+CodexAccountManager-1.0.0-Setup-x64.exe
+```
+
+目标是一个真正可以长期使用的 Codex 多账号 Windows 管理工具，而不是一次性的脚本。
