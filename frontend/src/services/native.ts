@@ -22,6 +22,7 @@ const mockState: AppState = {
 
 let bridge: NativeObject | null = null
 let qtBridge = false
+let connectionPromise: Promise<void> | null = null
 const listeners = new Map<string, Array<(payload: string) => void>>()
 
 function parseResult(value: string | undefined): Record<string, unknown> {
@@ -44,27 +45,59 @@ function getMockResult(method: string, args: unknown[]): string {
   return JSON.stringify({ accepted: false, error: '浏览器预览模式不支持该操作' })
 }
 
+function usePywebviewBridge(): boolean {
+  const api = window.pywebview?.api
+  if (!api) return false
+  bridge = api as NativeObject
+  qtBridge = false
+  return true
+}
+
+async function waitForPywebview(): Promise<void> {
+  if (usePywebviewBridge()) return
+
+  // pywebview 会在页面加载后异步注入 api；过早调用会被误判为浏览器预览。
+  await new Promise<void>((resolve) => {
+    let finished = false
+    const finish = (): void => {
+      if (finished) return
+      finished = true
+      window.removeEventListener('pywebviewready', finish)
+      resolve()
+    }
+    window.addEventListener('pywebviewready', finish, { once: true })
+    window.setTimeout(finish, 3000)
+  })
+  usePywebviewBridge()
+}
+
 export const native = {
   async connect(): Promise<void> {
     if (bridge) return
-    if (window.pywebview?.api) {
-      bridge = window.pywebview.api as NativeObject
-      return
-    }
-    if (window.qt?.webChannelTransport && window.QWebChannel) {
-      await new Promise<void>((resolve) => {
-        new window.QWebChannel!(window.qt!.webChannelTransport, (channel) => {
-          bridge = channel.objects.appBridge as NativeObject
-          qtBridge = true
-          for (const [name, callbacks] of listeners) {
-            const signal = bridge[name] as NativeSignal | undefined
-            signal?.connect((value) => callbacks.forEach((callback) => callback(value)))
-          }
-          resolve()
+    if (connectionPromise) return connectionPromise
+    connectionPromise = (async () => {
+      await waitForPywebview()
+      if (bridge) return
+      if (window.qt?.webChannelTransport && window.QWebChannel) {
+        await new Promise<void>((resolve) => {
+          new window.QWebChannel!(window.qt!.webChannelTransport, (channel) => {
+            bridge = channel.objects.appBridge as NativeObject
+            qtBridge = true
+            for (const [name, callbacks] of listeners) {
+              const signal = bridge[name] as NativeSignal | undefined
+              signal?.connect((value) => callbacks.forEach((callback) => callback(value)))
+            }
+            resolve()
+          })
         })
-      })
-    } else {
-      bridge = {}
+      } else {
+        bridge = {}
+      }
+    })()
+    try {
+      await connectionPromise
+    } finally {
+      connectionPromise = null
     }
   },
 
