@@ -7,6 +7,7 @@ Codex Account Manager 是一个本地运行的 Windows 托盘应用，用于管�
 - pywebview + 系统 Microsoft Edge WebView2 Runtime 托盘应用和单实例保护，不再内置 Chromium。
 - Vue 3 + TypeScript + Vite + Pinia + Element Plus 现代化界面，支持浅色、深色和跟随系统。
 - 从当前 Codex Home 导入账号；仅保存 `auth.json`，并通过第二次 `account/read` 验证邮箱一致才落盘。
+- 可在保存当前账号后直接进入“登录其他账号”流程：不调用 logout，只移走活动认证文件并启动未登录状态的 Codex。
 - Sessions、历史、插件、Skills 和用户配置共用，账号支持改名、删除、额度缓存和倒计时。
 - 使用官方 `codex app-server` 读取账号和多额度桶，不读取或上传 Token。
 - 切换前检测 Codex 进程，可在确认后关闭进程；共享 `CODEX_HOME` 保持不变，仅原子替换登录状态。
@@ -106,6 +107,8 @@ cli_auth_credentials_store = "file"
 这是 100% 本地应用。应用不会将 `auth.json`、Token、JWT、Authorization Header 或 API Key 写入配置、日志、Git 或第三方服务。日志只记录账号 ID、邮箱、Home 路径、App Server 状态和错误摘要，并会对常见敏感字段脱敏。
 
 切换账号不会执行 `codex logout` 或 `account/logout`，也不会改变用户代码项目；它只原子替换共享 Home 中的活动 `auth.json`。已经运行的 Codex 进程可能缓存旧登录状态，因此切换前必须关闭，并在完成后重新启动。
+
+添加多个账号时，先保存当前账号，再点击“登录其他账号”。应用会先同步当前账号最新认证快照，然后移走共享 Home 中的活动 `auth.json` 并启动 Codex 登录界面；此过程不会请求服务端注销。新账号登录完成后，回到账号管理器点击“添加当前账号”即可。
 
 ## 测试
 

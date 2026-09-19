@@ -28,6 +28,7 @@ const renameValue = ref('')
 const settingsDraft = reactive<AppSettings>({ ...store.settings })
 const now = ref(Date.now())
 const importing = ref(false)
+const preparingLogin = ref(false)
 const refreshingAll = ref(false)
 const refreshingIds = ref(new Set<string>())
 const switchingId = ref<string | null>(null)
@@ -39,9 +40,10 @@ let timer: number | undefined
 const hasAccounts = computed(() => store.accountCount > 0)
 const busy = computed(() => store.activeTasks.size > 0 || refreshingAll.value)
 const currentAccount = computed(() => store.accounts.find((account) => account.current) ?? null)
-const criticalBusy = computed(() => importing.value || Boolean(switchingId.value) || Boolean(removingId.value))
+const criticalBusy = computed(() => importing.value || preparingLogin.value || Boolean(switchingId.value) || Boolean(removingId.value))
 const operationText = computed(() => {
   if (importing.value) return '正在验证并保存当前登录状态…'
+  if (preparingLogin.value) return '正在保存当前认证并打开新账号登录…'
   if (switchingId.value) {
     const account = store.accounts.find((item) => item.id === switchingId.value)
     return `正在切换到 ${account?.name ?? '目标账号'}…`
@@ -177,10 +179,62 @@ async function importAccount(): Promise<void> {
     const detail = (result.result ?? {}) as { accountId?: string }
     const account = store.accounts.find((item) => item.id === detail.accountId)
     ElMessage.success(account ? `已保存账号：${account.name}` : '账号登录状态已保存')
+    try {
+      await ElMessageBox.confirm(
+        '当前账号已经安全保存。是否让 Codex 进入未登录状态，以便登录并添加另一个账号？\n\n此操作不会调用 logout，也不会使刚保存的认证失效。',
+        '继续添加其他账号？',
+        { type: 'info', confirmButtonText: '登录其他账号', cancelButtonText: '暂不添加' },
+      )
+      await prepareOtherLogin()
+    } catch {
+      // 用户暂不继续添加账号。
+    }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '导入失败，请查看应用日志')
   } finally {
     importing.value = false
+  }
+}
+
+async function performPrepareOtherLogin(closeCodex = false): Promise<void> {
+  const result = await native.prepareOtherAccountLogin(closeCodex)
+  if (result.accepted === false) {
+    ElMessage.error(String(result.error ?? '无法准备新账号登录'))
+    return
+  }
+  const detail = (result.result ?? {}) as { code?: string; success?: boolean }
+  if (detail.code === 'codex_running' && !closeCodex) {
+    try {
+      await ElMessageBox.confirm(
+        '需要先关闭正在运行的 Codex，才能安全保存当前认证并打开未登录界面。',
+        'Codex 正在运行',
+        { type: 'warning', confirmButtonText: '关闭并继续', cancelButtonText: '取消' },
+      )
+      await performPrepareOtherLogin(true)
+    } catch {
+      // 用户取消准备新账号登录。
+    }
+    return
+  }
+  if (detail.code === 'close_failed') {
+    ElMessage.error('无法关闭正在运行的 Codex，请手动关闭后重试')
+    return
+  }
+  if (detail.success) {
+    await store.load(false)
+    ElMessage.success('Codex 已进入未登录状态，登录后请点击“添加当前账号”')
+  }
+}
+
+async function prepareOtherLogin(): Promise<void> {
+  if (!hasAccounts.value || preparingLogin.value || switchingId.value || removingId.value) return
+  preparingLogin.value = true
+  try {
+    await performPrepareOtherLogin()
+  } catch (error) {
+    ElMessage.error(errorText(error, '无法准备新账号登录'))
+  } finally {
+    preparingLogin.value = false
   }
 }
 
@@ -400,6 +454,9 @@ onUnmounted(() => {
         <el-button class="ghost-button" :loading="busy" :disabled="criticalBusy" @click="refreshAll">
           <el-icon><Refresh /></el-icon>刷新全部
         </el-button>
+        <el-button v-if="hasAccounts" class="ghost-button login-button" :loading="preparingLogin" :disabled="criticalBusy || refreshingAll" @click="prepareOtherLogin">
+          <el-icon><SwitchButton /></el-icon><span>登录其他账号</span>
+        </el-button>
         <el-button class="primary-button" :loading="importing" :disabled="criticalBusy || refreshingAll" @click="importAccount">
           <el-icon><Upload /></el-icon>添加当前账号
         </el-button>
@@ -508,7 +565,7 @@ onUnmounted(() => {
           </div>
           <div v-else class="no-limits">
             <el-icon v-if="isRefreshing(account.id)" class="is-loading"><Loading /></el-icon>
-            <Key v-else />
+            <el-icon v-else><Key /></el-icon>
             <span>{{ isRefreshing(account.id) ? '正在读取最新额度…' : '暂无额度缓存，刷新后即可查看' }}</span>
           </div>
 
@@ -516,17 +573,17 @@ onUnmounted(() => {
           <div class="card-footer">
             <span>最近刷新 {{ lastRefresh(account) }}</span>
             <div class="footer-actions">
-              <el-button text class="small-action" :loading="isRefreshing(account.id)" :disabled="criticalBusy" @click="refreshOne(account)"><Refresh />刷新</el-button>
+              <el-button text class="small-action" :loading="isRefreshing(account.id)" :disabled="criticalBusy" @click="refreshOne(account)"><el-icon><Refresh /></el-icon><span>刷新</span></el-button>
               <el-button v-if="!account.current" class="switch-button" :loading="switchingId === account.id" :disabled="criticalBusy || isRefreshing(account.id)" @click="switchAccount(account)">切换账号</el-button>
-              <el-tag v-else class="active-label" effect="plain"><Check />正在使用</el-tag>
+              <el-tag v-else class="active-label" effect="plain"><el-icon><Check /></el-icon><span>正在使用</span></el-tag>
             </div>
           </div>
         </el-card>
       </div>
 
       <footer class="bottom-note">
-        <span><Check /> 所有凭据都保存在本机，不会上传到第三方服务器。</span>
-        <el-button text @click="native.openLogs"><FolderOpened />打开日志</el-button>
+        <span><el-icon><Check /></el-icon>所有凭据都保存在本机，不会上传到第三方服务器。</span>
+        <el-button text @click="native.openLogs"><el-icon><FolderOpened /></el-icon><span>打开日志</span></el-button>
       </footer>
     </main>
 

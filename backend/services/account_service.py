@@ -358,6 +358,67 @@ class AccountService:
         self.logger.info("账号切换成功 id=%s email=%s home=%s", account.id, account.email, home)
         return {"success": True, "accountId": account_id, "home": str(home)}
 
+    def prepare_other_account_login(self, close_codex: bool = False) -> dict[str, Any]:
+        """保留当前认证快照并移走活动认证，使 Codex 进入未登录状态。"""
+        running = self.process_service.find_codex_processes()
+        if running and not close_codex:
+            return {"success": False, "code": "codex_running"}
+        if running and not self.process_service.close_codex():
+            return {"success": False, "code": "close_failed", "message": "无法关闭正在运行的 Codex"}
+
+        # 提前检查可执行文件，避免清除活动认证后才发现无法启动登录界面。
+        executable = resolve_codex_executable()
+        if not executable:
+            raise AccountServiceError(
+                "未找到 Codex CLI，请确认已安装 Codex；应用已自动检查 PATH、npm 全局目录和常见安装目录"
+            )
+
+        with self._auth_lock:
+            home = self._shared_home()
+            if not home.is_dir():
+                raise AccountServiceError(f"共享 CODEX_HOME 不存在：{home}")
+            live_auth = home / "auth.json"
+            if not live_auth.is_file():
+                raise AccountServiceError("Codex 当前已处于未登录状态，请直接完成新账号登录")
+
+            original_auth = self._read_auth_bytes(live_auth)
+            previous_current = self.config.current_account
+            if previous_current:
+                current = self._find(previous_current)
+                live_info = self._read_account(home)
+                if self._email_from(live_info).casefold() != current.email.casefold():
+                    raise AccountServiceError("活动登录与当前账号不一致，请先添加当前账号再继续")
+                # 先保存可能已经轮换的 Token，确认快照落盘后才移走活动认证。
+                original_auth = self._read_auth_bytes(live_auth)
+                self._atomic_write_bytes(self._snapshot_path(current), original_auth)
+            else:
+                # currentAccount 为空通常表示正在添加流程中，禁止误删尚未导入的新登录。
+                raise AccountServiceError("当前登录尚未添加，请先点击“添加当前账号”保存后再继续")
+
+            try:
+                live_auth.unlink()
+                with self._lock:
+                    self.config.current_account = None
+                    self.config_service.save(self.config)
+            except Exception:
+                self.config.current_account = previous_current
+                self._atomic_write_bytes(live_auth, original_auth)
+                raise
+
+        self.environment_service.set_home(home)
+        try:
+            self._launch_codex(executable, home)
+        except Exception:
+            # 启动失败时恢复原活动认证和当前账号，避免用户停留在意外的未登录状态。
+            with self._auth_lock:
+                self._atomic_write_bytes(live_auth, original_auth)
+                with self._lock:
+                    self.config.current_account = previous_current
+                    self.config_service.save(self.config)
+            raise
+        self.logger.info("已准备其他账号登录 home=%s", home)
+        return {"success": True, "home": str(home)}
+
     def rename_account(self, account_id: str, name: str) -> dict[str, Any]:
         """修改账号显示名称。"""
         account = self._find(account_id)
@@ -402,13 +463,19 @@ class AccountService:
         executable = resolve_codex_executable()
         if not executable:
             raise AccountServiceError("未找到 Codex CLI，请确认已安装 Codex；应用已自动检查 PATH、npm 全局目录和常见安装目录")
+        self._launch_codex(executable, self._shared_home())
+        return {"accountId": account.id}
+
+    def _launch_codex(self, executable: str, home: Path) -> None:
+        """使用指定共享 Home 启动 Codex CLI。"""
         self.logger.info("使用 Codex CLI：%s", executable)
         env = os.environ.copy()
-        env["CODEX_HOME"] = str(self._shared_home())
+        env["CODEX_HOME"] = str(home)
         import subprocess
 
-        subprocess.Popen([executable], env=env, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-        return {"accountId": account.id}
+        subprocess.Popen(
+            [executable], env=env, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        )
 
     def _read_account(self, home: Path) -> dict[str, Any]:
         """在指定 Home 中读取账号信息。"""

@@ -156,3 +156,67 @@ def test_import_rejects_concurrent_request(tmp_path: Path, monkeypatch: pytest.M
             service.import_current_account()
     finally:
         service._import_lock.release()
+
+
+def test_prepare_other_login_preserves_snapshot_without_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """登录其他账号前应保存最新认证、移走活动文件且不调用服务端注销。"""
+    source_home = tmp_path / "source"
+    service = build_service(tmp_path, source_home, monkeypatch)
+    monkeypatch.setattr(service, "_read_account", fake_read_account)
+    monkeypatch.setattr(account_service_module, "resolve_codex_executable", lambda: "codex.exe")
+    launched: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        service, "_launch_codex", lambda executable, home: launched.append((executable, home))
+    )
+    write_auth(source_home, "user@example.com")
+    account_id = str(service.import_current_account()["accountId"])
+    write_auth(source_home, "user@example.com", generation=2)
+
+    result = service.prepare_other_account_login()
+
+    snapshot = json.loads(Path(service._find(account_id).auth_path).read_text(encoding="utf-8"))
+    assert result["success"] is True
+    assert snapshot["generation"] == 2
+    assert not (source_home / "auth.json").exists()
+    assert service.config.current_account is None
+    assert launched == [("codex.exe", source_home.resolve())]
+
+
+def test_prepare_other_login_rejects_unmanaged_active_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """添加流程中出现尚未保存的新登录时，不得直接删除其认证文件。"""
+    source_home = tmp_path / "source"
+    service = build_service(tmp_path, source_home, monkeypatch)
+    monkeypatch.setattr(account_service_module, "resolve_codex_executable", lambda: "codex.exe")
+    write_auth(source_home, "new@example.com")
+
+    with pytest.raises(AccountServiceError, match="尚未添加"):
+        service.prepare_other_account_login()
+
+    assert (source_home / "auth.json").is_file()
+
+
+def test_prepare_other_login_restores_auth_when_launch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未登录 Codex 启动失败时应恢复活动认证和当前账号标记。"""
+    source_home = tmp_path / "source"
+    service = build_service(tmp_path, source_home, monkeypatch)
+    monkeypatch.setattr(service, "_read_account", fake_read_account)
+    monkeypatch.setattr(account_service_module, "resolve_codex_executable", lambda: "codex.exe")
+    monkeypatch.setattr(
+        service,
+        "_launch_codex",
+        lambda executable, home: (_ for _ in ()).throw(OSError("launch failed")),
+    )
+    write_auth(source_home, "user@example.com")
+    account_id = str(service.import_current_account()["accountId"])
+
+    with pytest.raises(OSError, match="launch failed"):
+        service.prepare_other_account_login()
+
+    assert (source_home / "auth.json").is_file()
+    assert service.config.current_account == account_id

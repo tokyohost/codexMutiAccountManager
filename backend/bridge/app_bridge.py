@@ -45,6 +45,12 @@ class AppBridge:
         """切换账号，close_codex 表示用户已确认关闭 Codex。"""
         return self._submit(lambda: self.account_service.switch_account(account_id, close_codex))
 
+    def prepareOtherAccountLogin(self, close_codex: bool = False) -> str:
+        """保存当前认证并启动处于未登录状态的 Codex。"""
+        return self._submit(
+            lambda: self.account_service.prepare_other_account_login(close_codex)
+        )
+
     def refreshAccount(self, account_id: str) -> str:
         """刷新单个账号。"""
         return self._submit(lambda: self.account_service.refresh_account(account_id))

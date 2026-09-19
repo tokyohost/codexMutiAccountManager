@@ -135,6 +135,9 @@ export const native = {
   async switchAccount(id: string, closeCodex = false): Promise<Record<string, unknown>> {
     return this.call('switchAccount', id, closeCodex)
   },
+  async prepareOtherAccountLogin(closeCodex = false): Promise<Record<string, unknown>> {
+    return this.call('prepareOtherAccountLogin', closeCodex)
+  },
   async refreshAccount(id: string): Promise<Record<string, unknown>> {
     return this.call('refreshAccount', id)
   },
